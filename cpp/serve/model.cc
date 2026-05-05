@@ -1264,8 +1264,9 @@ class ModelImpl : public ModelObj {
     }
     if (auto it = mrope_prefilled_length_by_seq_id_.find(parent_seq_id);
         it != mrope_prefilled_length_by_seq_id_.end()) {
+      int64_t mrope_fork_pos = fork_pos == -1 ? it->second : fork_pos;
       mrope_prefilled_length_by_seq_id_[child_seq_id] =
-          static_cast<int>(std::min<int64_t>(it->second, fork_pos));
+          static_cast<int>(std::min<int64_t>(it->second, mrope_fork_pos));
     }
   }
 

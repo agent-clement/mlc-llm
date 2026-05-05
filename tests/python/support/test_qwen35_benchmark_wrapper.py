@@ -481,7 +481,7 @@ def test_compile_im_dry_run_preserves_semicolon_arguments() -> None:
 
     assert result.returncode == 0
     assert "dry_run " in result.stdout
-    assert "explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-cuda.so" in result.stdout
+    assert "explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-noverify-pc320-cuda.so" in result.stdout
     assert "--opt flashinfer=1\\;cublas_gemm=1\\;cudagraph=1\\;cutlass=1" in result.stdout
     assert (
         "--overrides context_window_size=2048\\;prefill_chunk_size=320\\;max_batch_size=1"
@@ -498,10 +498,9 @@ def test_compile_im_defaults_to_current_best_graph_capture_knobs() -> None:
     assert 'TVM_CUDA_GRAPH_CAPTURE_KV_CACHE_APPEND_METADATA:-1' in script
     assert 'TVM_CUDA_GRAPH_RELAXED_KV_CACHE_METADATA_TUPLES:-1' in script
     assert 'TVM_CUDA_GRAPH_CAPTURE_FUNC_OUTPUTS:-1' in script
-    assert (
-        'LIB_SUFFIX="${LIB_SUFFIX:--explicitcrosscg-appendmetacg-relaxedmeta-outputcapture}"'
-        in script
-    )
+    assert 'MLC_QWEN35_OMIT_VERIFY="${MLC_QWEN35_OMIT_VERIFY:-1}"' in script
+    assert 'DEFAULT_LIB_SUFFIX="${DEFAULT_LIB_SUFFIX}-noverify-pc${PREFILL_CHUNK_SIZE}"' in script
+    assert 'LIB_SUFFIX="${LIB_SUFFIX:-$DEFAULT_LIB_SUFFIX}"' in script
 
 
 def test_cuda_graph_dump_analyzer_can_gate_current_decode_shape(tmp_path: Path) -> None:

@@ -24,11 +24,14 @@ class PrefixCacheImpl : public PrefixCacheObj {
    * \brief Constructor of paged radix tree.
    * \param max_num_recycling_seqs The maximum number of sequences in prefix cache.
    * \param remove_callback The optional callback function to call when removing a sequence.
+   * \param allow_non_tail_forks Whether active sequences may be forked from historical offsets.
    */
-  explicit PrefixCacheImpl(size_t max_num_recycling_seqs, PrefixCacheRemoveCallback remove_callback)
+  explicit PrefixCacheImpl(size_t max_num_recycling_seqs, PrefixCacheRemoveCallback remove_callback,
+                           bool allow_non_tail_forks)
       : radix_tree_(PagedRadixTree::Create()),
         max_num_recycling_seqs_(max_num_recycling_seqs),
-        remove_callback_(std::move(remove_callback)) {
+        remove_callback_(std::move(remove_callback)),
+        allow_non_tail_forks_(allow_non_tail_forks) {
     recycling_seq_lrus_.clear();
     reversed_recycling_seq_lrus_.clear();
     seq_states_.clear();
@@ -117,6 +120,10 @@ class PrefixCacheImpl : public PrefixCacheObj {
         auto [matched_seq_sliding_window_size, matched_seq_attention_sink_size] =
             seq_sliding_window_infos_.at(matched_seq_id);
         if (matched_seq_sliding_window_size != -1) {
+          continue;
+        }
+        if (!allow_non_tail_forks_ &&
+            matched_offset != radix_tree_->GetSequenceLength(matched_seq_id)) {
           continue;
         }
         // If the matched is not enabled with sliding window, we can fork within matched offset
@@ -317,6 +324,13 @@ class PrefixCacheImpl : public PrefixCacheObj {
    */
   PrefixCacheRemoveCallback remove_callback_ = nullptr;
   /*!
+   * \brief Whether active sequences may be forked from historical offsets.
+   *
+   * Hybrid KV/RNN state can only safely fork from the parent's current tail because the RNN state
+   * stores current recurrent state rather than historical states for arbitrary prefix offsets.
+   */
+  bool allow_non_tail_forks_ = true;
+  /*!
    * \brief The map from sequence to its sequence states.
    */
   std::unordered_map<int64_t, SequenceState> seq_states_;
@@ -425,9 +439,11 @@ class NoPrefixCache : public PrefixCacheObj {
 };
 
 PrefixCache PrefixCache::CreateRadixPrefixCache(size_t max_num_recycling_seqs,
-                                                PrefixCacheRemoveCallback remove_callback) {
+                                                PrefixCacheRemoveCallback remove_callback,
+                                                bool allow_non_tail_forks) {
   ObjectPtr<PrefixCacheImpl> n =
-      tvm::ffi::make_object<PrefixCacheImpl>(max_num_recycling_seqs, std::move(remove_callback));
+      tvm::ffi::make_object<PrefixCacheImpl>(max_num_recycling_seqs, std::move(remove_callback),
+                                             allow_non_tail_forks);
   return PrefixCache(std::move(n));
 }
 

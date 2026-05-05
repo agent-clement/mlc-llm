@@ -18,7 +18,7 @@ DEFAULT_MLC_MODEL = (
 DEFAULT_MLC_MODEL_LIB = (
     "dist/libs/"
     "logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-"
-    "explicit-paged-stabledecodeinput-cuda.so"
+    "explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-noverify-pc320-cuda.so"
 )
 DEFAULT_VLLM_MODEL = "dist/logos-multitask-qwen3.5-2026-05-03-best-vllm-hf-tokenizercompat"
 PROCESSOR_USE_FAST_CHOICES = ("auto", "true", "false")

@@ -52,7 +52,13 @@ PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-320}"
 MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-1}"
 KV_CACHE_PAGE_SIZE="${KV_CACHE_PAGE_SIZE:-16}"
 OPT="${OPT:-flashinfer=1;cublas_gemm=1;faster_transformer=0;cudagraph=1;cutlass=1;ipc_allreduce_strategy=NONE}"
-LIB_SUFFIX="${LIB_SUFFIX:--explicitcrosscg-appendmetacg-relaxedmeta-outputcapture}"
+MLC_QWEN35_OMIT_VERIFY="${MLC_QWEN35_OMIT_VERIFY:-1}"
+export MLC_QWEN35_OMIT_VERIFY
+DEFAULT_LIB_SUFFIX="-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture"
+if [[ "$MLC_QWEN35_OMIT_VERIFY" == "1" ]]; then
+  DEFAULT_LIB_SUFFIX="${DEFAULT_LIB_SUFFIX}-noverify-pc${PREFILL_CHUNK_SIZE}"
+fi
+LIB_SUFFIX="${LIB_SUFFIX:-$DEFAULT_LIB_SUFFIX}"
 MODEL_SUFFIX="${MODEL_SUFFIX:--fusedinproj}"
 SKIP_GEN_CONFIG="${SKIP_GEN_CONFIG:-0}"
 SKIP_CONVERT="${SKIP_CONVERT:-0}"

@@ -222,7 +222,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
       return false;
     }
     for (const GenerationConfig& cfg : generation_cfg) {
-      if (cfg->temperature >= eps_ || cfg->top_logprobs != 0) {
+      if (cfg->temperature >= eps_ || cfg->top_logprobs != 0 || cfg->logprobs) {
         return false;
       }
     }

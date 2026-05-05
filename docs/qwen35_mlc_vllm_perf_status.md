@@ -9,7 +9,7 @@ Run the current MLC path with:
 
 ```bash
 MLC_MODEL=dist/logos-multitask-qwen3.5-2026-05-03-best-fusedinproj-q0f16-ctx2048-pc320-MLC \
-MLC_MODEL_LIB=dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-cuda.so \
+MLC_MODEL_LIB=dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-noverify-pc320-cuda.so \
 ./run_im.sh \
   --image kentucky.png \
   --fit-image-size 512 \
@@ -24,7 +24,7 @@ Or run both current wrappers with:
 
 ```bash
 MLC_MODEL=dist/logos-multitask-qwen3.5-2026-05-03-best-fusedinproj-q0f16-ctx2048-pc320-MLC \
-MLC_MODEL_LIB=dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-cuda.so \
+MLC_MODEL_LIB=dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-noverify-pc320-cuda.so \
 ./benchmark_qwen35_vllm_mlc.py \
   --image kentucky.png \
   --max-tokens 128 \

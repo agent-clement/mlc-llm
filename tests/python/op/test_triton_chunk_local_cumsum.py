@@ -1,5 +1,8 @@
 import numpy as np
 import pytest
+
+pytest.importorskip("triton")
+
 import torch
 import tvm
 from tvm import relax

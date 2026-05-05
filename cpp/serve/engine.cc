@@ -432,12 +432,16 @@ class EngineImpl : public Engine {
     EngineConfig engine_config = engine_config_res.Unwrap();
     {
       if (engine_config->prefix_cache_mode == PrefixCacheMode::kRadix) {
+        KVStateKind kv_state_kind = n->models_[0]->GetMetadata().kv_state_kind;
+        bool allow_non_tail_forks =
+            kv_state_kind != KVStateKind::kHybrid && kv_state_kind != KVStateKind::kRNNState;
         n->estate_->prefix_cache = PrefixCache::CreateRadixPrefixCache(
             static_cast<size_t>(engine_config->prefix_cache_max_num_recycling_seqs),
             [engine_ptr = n.get()](int64_t seq_id) {
               RemoveRequestFromModel(engine_ptr->estate_, seq_id, engine_ptr->models_);
               engine_ptr->estate_->id_manager.RecycleId(seq_id);
-            });
+            },
+            allow_non_tail_forks);
       } else if (engine_config->prefix_cache_mode == PrefixCacheMode::kDisable) {
         n->estate_->prefix_cache = PrefixCache::CreateNoPrefixCache();
       } else {

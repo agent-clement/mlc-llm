@@ -138,9 +138,11 @@ class PrefixCache : public ObjectRef {
    * \brief Initialization of prefix cache.
    * \param max_recycling_seqs The maximum number of recycling sequences in prefix cache.
    * \param remove_callback The optional callback function to call when removing a sequence.
+   * \param allow_non_tail_forks Whether active sequences may be forked from historical offsets.
    */
   static PrefixCache CreateRadixPrefixCache(size_t max_recycling_seqs,
-                                            PrefixCacheRemoveCallback remove_callback = nullptr);
+                                            PrefixCacheRemoveCallback remove_callback = nullptr,
+                                            bool allow_non_tail_forks = true);
   /*!
    * \brief Initialization of no prefix cache.
    */
