@@ -32,7 +32,7 @@ def test_nn_module_paged_kv_cache():
             support_sliding_window = T.int64()
             R.func_attr({"num_input": 5})
             with R.dataflow():
-                paged_kv_cache: R.Object = R.call_pure_packed("mlc.create_paged_kv_cache_generic", R.str("mha"), R.shape([max_batch_size, max_total_seq_len, prefill_chunk_size, page_size, support_sliding_window]), R.shape([0, 32]), R.prim_value(32), R.prim_value(32), R.prim_value(32), R.prim_value(128), R.prim_value(128), R.prim_value(0), R.prim_value(0), R.prim_value(1), R.prim_value(1), R.prim_value(10000), R.str("{}"), R.prim_value(0), R.prim_value(128), R.prim_value(0), R.dtype("float16"), sinfo_args=(R.Object,))  # noqa: E501
+                paged_kv_cache: R.Object = R.call_pure_packed("mlc.create_paged_kv_cache_generic", R.str("mha"), R.shape([max_batch_size, max_total_seq_len, prefill_chunk_size, page_size, support_sliding_window, T.int64(0)]), R.shape([0, 32]), R.prim_value(32), R.prim_value(32), R.prim_value(32), R.prim_value(128), R.prim_value(128), R.prim_value(0), R.prim_value(0), R.prim_value(1), R.prim_value(1), R.prim_value(10000), R.str("{}"), R.prim_value(0), R.prim_value(128), R.prim_value(0), R.dtype("float16"), sinfo_args=(R.Object,))  # noqa: E501
                 gv1: R.Object = paged_kv_cache
                 R.output(gv1)
             return gv1
@@ -395,6 +395,84 @@ def test_vllm_cache_layout_runtime_append_debug_roundtrip():
     debug_get_kv(cache, 8, 0, seq_len + 1, forked_k, forked_v)
     np.testing.assert_array_equal(forked_k.numpy()[0], forked_k_expected)
     np.testing.assert_array_equal(forked_v.numpy()[0], forked_v_expected)
+
+
+def test_vllm_cache_layout_runtime_metadata_uses_cache_config_without_env(monkeypatch):
+    monkeypatch.delenv("MLC_QWEN35_FA2_VLLM_CACHE_LAYOUT", raising=False)
+    num_layers = 1
+    num_qo_heads = 4
+    num_kv_heads = 2
+    head_dim = 8
+    page_size = 4
+    dtype = "float16"
+    device = tvm.cpu()
+    target = "llvm"
+
+    copy_page = tvm.tirx.build(
+        tvm_kv_cache._copy_single_page_cpu(num_kv_heads, page_size, head_dim, dtype),
+        target=target,
+    ).main
+    debug = tvm.tirx.build(
+        tvm_kv_cache._kv_cache_debug_get_kv(num_layers, num_kv_heads, head_dim, dtype),
+        target=target,
+    ).main
+    compact = tvm.tirx.build(
+        tvm_kv_cache._compact_kv_copy_cpu(num_kv_heads, head_dim, dtype),
+        target=target,
+    ).main
+    merge = tvm.tirx.build(tvm_kv_cache._merge_state_inplace_cpu(dtype), target=target).main
+    split_rotary = tvm.tirx.build(
+        tvm_kv_cache.llama_rope_with_position_map(
+            10000.0, 1.0, head_dim, num_qo_heads, num_kv_heads, dtype, {}
+        ),
+        target=target,
+    ).main
+
+    create = tvm.get_global_func("vm.builtin.paged_attention_kv_cache_create")
+    cache = create(
+        tvm.runtime.ShapeTuple([4, 64, 16, page_size, 0, 1]),
+        tvm.runtime.ShapeTuple([0, num_layers]),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        head_dim,
+        tvm.runtime.ShapeTuple([0]),
+        False,
+        0,
+        1.0,
+        10000.0,
+        None,
+        tvm.runtime.empty((), dtype, device=device),
+        None,
+        None,
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [merge],
+        split_rotary,
+        copy_page,
+        debug,
+        compact,
+    )
+
+    add_sequence = tvm.get_global_func("vm.builtin.kv_state_add_sequence")
+    begin_forward = tvm.get_global_func("vm.builtin.kv_state_begin_forward")
+    get_fa2_metadata = tvm.get_global_func(
+        "vm.builtin.attention_kv_cache_get_fa2_paged_decode_metadata"
+    )
+
+    add_sequence(cache, 7)
+    begin_forward(cache, tvm.runtime.ShapeTuple([7]), tvm.runtime.ShapeTuple([1]), None)
+    k_pages, v_pages, *_ = get_fa2_metadata(cache, 0, 0)
+
+    assert len(k_pages.shape) == 5
+    assert tuple(k_pages.shape[1:]) == (num_kv_heads, 1, page_size, head_dim)
+    assert tuple(v_pages.shape[1:]) == (num_kv_heads, head_dim, page_size)
 
 
 def test_nn_module_paged_decode_metadata_tensors():

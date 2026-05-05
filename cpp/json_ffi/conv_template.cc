@@ -83,7 +83,7 @@ ModelVisionConfig ModelVisionConfig::FromJSON(const tvm::ffi::json::Object& json
   if (spatial_merge_size_res.IsOk()) {
     config.spatial_merge_size = static_cast<int>(spatial_merge_size_res.Unwrap());
   } else {
-    config.spatial_merge_size = 1;
+    config.spatial_merge_size = 2;
   }
 
   Result<int64_t> min_pixels_res = json::LookupWithResultReturn<int64_t>(json_obj, "min_pixels");

@@ -38,7 +38,7 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
             assert attention_type.value in ["mha", "mla", "mha_sliding"]
         attn_kind = [args[0].fields[i].value for i in range(len(args[0]))]
     assert isinstance(args[1], relax.ShapeExpr)
-    assert len(args[1].values) == 5
+    assert len(args[1].values) in [5, 6]
     assert isinstance(args[2], relax.ShapeExpr)
     for i in range(3, 18):
         if i in [13, 14, 17]:
@@ -56,6 +56,9 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:  # noqa: UP00
         "prefill_chunk_size": args[1].values[2],
         "page_size": args[1].values[3],
         "support_sliding_window": args[1].values[4],
+        "use_fa2_vllm_cache_layout": (
+            args[1].values[5] if len(args[1].values) >= 6 else tvm.tirx.IntImm("int64", 0)
+        ),
         "layer_partition": args[2],
         "num_hidden_layers": args[3].value.value,
         "num_attention_heads": args[4].value.value,

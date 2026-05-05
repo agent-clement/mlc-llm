@@ -325,6 +325,9 @@ class PagedKVCache(TVMPagedKVCache):
             rx_attn_kind = [rx.StringImm(layer_kind) for layer_kind in attn_kind]
         else:
             rx_attn_kind = rx.StringImm(attn_kind)
+        use_fa2_vllm_cache_layout = tirx.IntImm(
+            "int64", int(os.environ.get("MLC_QWEN35_FA2_VLLM_CACHE_LAYOUT", "0") == "1")
+        )
         return PagedKVCache(
             _expr=rx.call_pure_packed(
                 "mlc.create_paged_kv_cache_generic",
@@ -336,6 +339,7 @@ class PagedKVCache(TVMPagedKVCache):
                         prefill_chunk_size,
                         page_size,
                         support_sliding_window,
+                        use_fa2_vllm_cache_layout,
                     ]
                 ),
                 rx.ShapeExpr(layer_partition),

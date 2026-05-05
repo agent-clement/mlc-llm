@@ -1,4 +1,5 @@
 #include "json_ffi/conv_template.h"
+#include "support/json_parser.h"
 
 #include <gtest/gtest.h>
 
@@ -157,6 +158,22 @@ TEST(JsonFFIConvTest, LoadJSONTextContentTest) { _TestConvTemplateLoadJSONTextCo
 TEST(JsonFFIConvTest, LoadJSONPartsContentTest) { _TestConvTemplateLoadJSONPartsContent(); }
 TEST(JsonFFIConvTest, LoadJSONNestedImageURLContentTest) {
   _TestConvTemplateLoadJSONNestedImageURLContent();
+}
+
+TEST(JsonFFIConvTest, Qwen35VisionConfigDefaultsMatchImageEmbedDefaults) {
+  auto json_obj = json::ParseToJSONObjectWithResultReturn(
+      "{"
+      "  \"patch_size\": 16,"
+      "  \"min_pixels\": 65536,"
+      "  \"max_pixels\": 16777216"
+      "}");
+  ASSERT_TRUE(json_obj.IsOk());
+
+  ModelVisionConfig config = ModelVisionConfig::FromJSON(json_obj.Unwrap());
+  EXPECT_EQ(config.patch_size, 16);
+  EXPECT_EQ(config.spatial_merge_size, 2);
+  EXPECT_EQ(config.min_pixels, 65536);
+  EXPECT_EQ(config.max_pixels, 16777216);
 }
 
 }  // namespace json_ffi
