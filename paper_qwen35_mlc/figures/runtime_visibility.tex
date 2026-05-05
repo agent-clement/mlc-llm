@@ -1,0 +1,44 @@
+\begin{tikzpicture}
+\begin{axis}[
+    width=\linewidth,
+    height=0.48\linewidth,
+    ymin=0,
+    ymax=450,
+    ylabel={launches/token},
+    symbolic x coords={no graph,CUDA graph},
+    xtick=data,
+    axis y line*=left,
+    grid=major,
+    major grid style={draw=black!10},
+    legend style={at={(0.02,0.98)},anchor=north west,font=\scriptsize},
+]
+\addplot+[ybar, bar width=16pt, fill=blue!55, draw=blue!70] coordinates {
+    (no graph,415.0)
+    (CUDA graph,1.0)
+};
+\addlegendentry{launches/token}
+\end{axis}
+\begin{axis}[
+    width=\linewidth,
+    height=0.48\linewidth,
+    ymin=0,
+    ymax=2400,
+    axis y line*=right,
+    axis x line=none,
+    ylabel={microseconds/token},
+    symbolic x coords={no graph,CUDA graph},
+    xtick=data,
+    legend style={at={(0.98,0.98)},anchor=north east,font=\scriptsize},
+]
+\addplot+[mark=square*, thick, orange] coordinates {
+    (no graph,2250.376)
+    (CUDA graph,0.978)
+};
+\addlegendentry{visible kernels}
+\addplot+[mark=*, thick, green!50!black] coordinates {
+    (no graph,0.0)
+    (CUDA graph,2189.405)
+};
+\addlegendentry{graph trace}
+\end{axis}
+\end{tikzpicture}

@@ -1,5 +1,6 @@
 """The pass that attaches GPU sampler functions to the IRModule."""
 
+import os
 from typing import Dict  # noqa: UP035
 
 import tvm
@@ -9,6 +10,7 @@ from tvm.script import tirx as T
 
 from mlc_llm.op.batch_spec_verify import batch_spec_verify
 from mlc_llm.op.top_p_pivot import top_p_pivot, top_p_renorm
+from mlc_llm.support.max_thread_check import get_max_num_threads_per_block
 
 
 @tvm.transform.module_pass(opt_level=0, name="AttachGPUSamplingFunc")
@@ -47,6 +49,7 @@ class AttachGPUSamplingFunc:
             gv_names = [
                 gv.name_hint
                 for gv in [
+                    _attach_argmax_logits_func(bb, self.target),
                     _attach_multinomial_sampling_func(bb),
                     _attach_argsort_func(bb),
                     _attach_sample_with_top_p(bb),
@@ -64,6 +67,114 @@ class AttachGPUSamplingFunc:
                 .with_attr("tir_non_negative_var", self.non_negative_var)
             )
         return mod
+
+
+def _get_argmax_logits_tir(target: tvm.target.Target):
+    tx = min(256, get_max_num_threads_per_block(target))
+    items_per_thread = 8
+    chunk_elems = tx * items_per_thread
+
+    @T.prim_func(private=True)
+    def argmax_logits_partial_tir(
+        var_logits: T.handle, var_partial_values: T.handle, var_partial_indices: T.handle
+    ) -> None:
+        T.func_attr({"tirx.is_scheduled": 1, "tirx.noalias": True})
+        batch_size = T.int32(is_size_var=True)
+        vocab_size = T.int32(is_size_var=True)
+        num_chunks = T.int32(is_size_var=True)
+        logits = T.match_buffer(var_logits, (batch_size, vocab_size), "float32")
+        partial_values = T.match_buffer(var_partial_values, (batch_size, num_chunks, tx), "float32")
+        partial_indices = T.match_buffer(var_partial_indices, (batch_size, num_chunks, tx), "int32")
+
+        with T.sblock("kernel"):
+            local_max = T.sblock_alloc_buffer((1,), "float32", scope="local")
+            local_idx = T.sblock_alloc_buffer((1,), "int32", scope="local")
+
+            for b in T.thread_binding(0, batch_size, thread="blockIdx.y"):
+                for c in T.thread_binding(0, num_chunks, thread="blockIdx.x"):
+                    for t in T.thread_binding(0, tx, thread="threadIdx.x"):
+                        local_max[0] = T.min_value("float32")
+                        local_idx[0] = -1
+                        for i in T.unroll(items_per_thread):
+                            idx = c * chunk_elems + i * tx + t
+                            if idx < vocab_size:
+                                value = logits[b, idx]
+                                if tirx.any(
+                                    value > local_max[0],
+                                    tirx.all(value == local_max[0], idx < local_idx[0]),
+                                ):
+                                    local_max[0] = value
+                                    local_idx[0] = idx
+                        partial_values[b, c, t] = local_max[0]
+                        partial_indices[b, c, t] = local_idx[0]
+
+    @T.prim_func(private=True)
+    def argmax_logits_final_tir(
+        var_partial_values: T.handle, var_partial_indices: T.handle, var_token_ids: T.handle
+    ) -> None:
+        T.func_attr({"tirx.is_scheduled": 1, "tirx.noalias": True})
+        batch_size = T.int32(is_size_var=True)
+        num_chunks = T.int32(is_size_var=True)
+        partial_values = T.match_buffer(var_partial_values, (batch_size, num_chunks, tx), "float32")
+        partial_indices = T.match_buffer(var_partial_indices, (batch_size, num_chunks, tx), "int32")
+        token_ids = T.match_buffer(var_token_ids, (batch_size,), "int32")
+
+        with T.sblock("kernel"):
+            local_max = T.sblock_alloc_buffer((1,), "float32", scope="local")
+            local_idx = T.sblock_alloc_buffer((1,), "int32", scope="local")
+            for b in T.thread_binding(0, batch_size, thread="blockIdx.x"):
+                for t in T.thread_binding(0, 1, thread="threadIdx.x"):
+                    local_max[0] = T.min_value("float32")
+                    local_idx[0] = -1
+                    for c in T.serial(num_chunks):
+                        for i in T.serial(tx):
+                            idx = partial_indices[b, c, i]
+                            if idx >= 0:
+                                value = partial_values[b, c, i]
+                                if tirx.any(
+                                    value > local_max[0],
+                                    tirx.all(value == local_max[0], idx < local_idx[0]),
+                                ):
+                                    local_max[0] = value
+                                    local_idx[0] = idx
+                    token_ids[b] = local_idx[0]
+
+    return argmax_logits_partial_tir, argmax_logits_final_tir, tx, chunk_elems
+
+
+def _attach_argmax_logits_func(bb: relax.BlockBuilder, target: tvm.target.Target):
+    batch_size = tirx.SizeVar("batch_size", "int64")
+    vocab_size = tirx.SizeVar("vocab_size", "int64")
+    logits = relax.Var("logits", relax.TensorStructInfo((batch_size, vocab_size), "float32"))
+    with bb.function("argmax_logits", [logits]):
+        with bb.dataflow():
+            if os.getenv("MLC_EXPERIMENTAL_FAST_ARGMAX_TIR") == "1":
+                partial_func, final_func, tx, chunk_elems = _get_argmax_logits_tir(target)
+                num_chunks = (vocab_size + chunk_elems - 1) // chunk_elems
+                partial_value_sinfo = relax.TensorStructInfo(
+                    (batch_size, num_chunks, tx), "float32"
+                )
+                partial_index_sinfo = relax.TensorStructInfo((batch_size, num_chunks, tx), "int32")
+                partial = bb.emit(
+                    relax.call_tir(
+                        bb.add_func(partial_func, "argmax_logits_partial_tir"),
+                        [logits],
+                        out_sinfo=[partial_value_sinfo, partial_index_sinfo],
+                    )
+                )
+                argmax = bb.emit(
+                    relax.call_tir(
+                        bb.add_func(final_func, "argmax_logits_final_tir"),
+                        list(partial),
+                        out_sinfo=relax.TensorStructInfo((batch_size,), "int32"),
+                    )
+                )
+            else:
+                argmax = bb.emit(relax.op.argmax(logits, axis=1))
+                argmax = bb.emit(relax.op.astype(argmax, "int32"))
+            output = bb.emit_output(argmax)
+        gv = bb.emit_func_output(output)
+    return gv
 
 
 def _attach_multinomial_sampling_func(bb: relax.BlockBuilder):

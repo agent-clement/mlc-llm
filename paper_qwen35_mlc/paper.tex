@@ -1,0 +1,419 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{subcaption}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\pgfplotsset{compat=1.18}
+
+\title{Bringing Qwen3.5-0.8B Vision-Language Inference to MLC LLM: \\
+An Engineering Report on Model Support, Correctness, and Batch-1 Performance}
+
+\author{
+  Familiar AI Engineering Notes \\
+  \texttt{familiar-ai/logos-multitask-qwen3.5-2026-05-03-best}
+}
+
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report on an implementation effort that added support for a fine-tuned
+Qwen3.5 0.8B vision-language model in MLC LLM. The work covered model
+configuration, tokenizer and image preprocessing parity, a vision tower,
+multi-rope positional handling, mixed full-attention and linear-attention
+decoder layers, Gated DeltaNet state management, weight conversion, MLC model
+library compilation, and apples-to-apples benchmarking against Transformers and
+vLLM. The resulting CUDA artifact runs the Familiar AI checkpoint on a
+single-image batch-1 workload with the same image grid and generated-token
+count as the vLLM baseline. On the Kentucky image prompt with 128 generated
+tokens, the current MLC path measured 414.23 generated tokens/s and 446.09
+effective decode tokens/s, while the vLLM path measured 413.30 generated
+tokens/s. This report is not a claim of general serving superiority; instead,
+it is an arXiv-style engineering paper that records the design, validation
+methodology, performance trajectory, diagrams, and lessons learned from bringing
+one non-standard multimodal architecture to a machine-learning compiler stack.
+\end{abstract}
+
+\section{Introduction}
+
+Large language model deployment is no longer a matter of compiling a single
+Transformer block. Modern checkpoints combine custom tokenizers, image or audio
+front-ends, grouped-query attention, hybrid state-space or linear-attention
+layers, rotary variants, and runtime-specific cache formats. Compiler-based
+systems such as TVM and MLC LLM promise portability and aggressive
+specialization, but that promise is tested most sharply by non-standard model
+families whose inference semantics do not already match common LLaMA-style
+templates.
+
+This paper documents the work required to support a fine-tuned Familiar AI
+Qwen3.5 0.8B vision-language checkpoint in MLC LLM. The model uses a vision
+tower, multimodal rotary position handling, 24 language layers, a repeated
+pattern of Gated DeltaNet linear-attention layers and full-attention layers, and
+a large vocabulary. The deployment target studied here is deliberately narrow:
+single-GPU CUDA, batch size 1, one image, and fixed-token generation. This
+setting was chosen because it is small enough to diagnose precisely and
+important enough to expose the interaction between model semantics, compiler
+lowering, external kernels, and runtime scheduling.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/system_pipeline.tex}
+  \caption{End-to-end path from Hugging Face checkpoint to MLC model library and
+  benchmark comparison.}
+  \label{fig:pipeline}
+\end{figure}
+
+The central result is parity with a vLLM baseline on the same model and image
+preprocessing path. The result emerged less from a single optimization than
+from a sequence of correctness and systems changes: image grid parity,
+configuration handling, safe weight remapping, Gated DeltaNet support, stable
+decode inputs, explicit paged metadata, CUDA graph capture, and robust
+benchmarking. Figure~\ref{fig:pipeline} sketches the resulting workflow.
+
+\section{Background}
+
+\paragraph{MLC LLM and TVM.}
+MLC LLM builds on TVM's compiler stack, which lowers high-level model programs
+to optimized target-specific code through graph-level and tensor-level
+transformations~\cite{chen2018tvm}. In the deployment studied here, MLC exports
+model functions such as image embedding, multimodal prefill, and multimodal
+decode into a compiled CUDA shared library and a parameter shard directory.
+
+\paragraph{vLLM.}
+vLLM is a high-throughput LLM serving system best known for PagedAttention,
+which manages KV cache memory in blocks and decouples logical sequence layout
+from physical allocation~\cite{kwon2023pagedattention}. It is the relevant
+competitor for this work because it is optimized for online decoding and
+already supports modern attention backends and CUDA graph reuse.
+
+\paragraph{FlashInfer.}
+FlashInfer provides optimized and customizable inference kernels for attention
+and related LLM serving operations~\cite{flashinfer2025}. In the MLC artifact
+described here, FlashInfer is used for full-attention paths while cuBLAS handles
+many projection and LM-head matrix-vector operations.
+
+\section{Model Support}
+
+The Familiar AI checkpoint used in this study is a fine-tuned Qwen3.5
+vision-language model. The implementation had to represent both the vision
+front-end and the language stack in MLC's Python model frontend.
+
+\subsection{Configuration}
+
+The language model has hidden size 1024, 24 decoder layers, 8 attention heads,
+2 key-value heads for full attention, head dimension 256, and vocabulary size
+248320. The benchmark artifact uses context window 2048, prefill chunk size
+320, batch size 1, and unquantized fp16 weights with bf16 model compute where
+configured. The model contains 852,985,920 parameters and converted weights
+occupy approximately 1.589 GB.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/model_structure.tex}
+  \caption{Layer pattern in the 24-layer language stack. Every fourth layer is
+  full attention; the remaining layers use a Gated DeltaNet linear-attention
+  block.}
+  \label{fig:model-structure}
+\end{figure}
+
+\subsection{Vision-Language Path}
+
+The image path resizes the input to a fixed 512 by 512 canvas for the benchmark,
+producing a grid of $(1,32,32)$ before spatial merge. The vision tower embeds
+1024 patches and the merger produces 256 image tokens for the language model.
+The MLC, Transformers, and vLLM paths were checked to use matching image-grid
+metadata before reporting performance comparisons.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/image_path.tex}
+  \caption{Image embedding path used in the benchmark. Matching the
+  $1 \times 32 \times 32$ grid across MLC, Transformers, and vLLM was a
+  prerequisite for apples-to-apples comparison.}
+  \label{fig:image-path}
+\end{figure}
+
+\subsection{Hybrid Decoder}
+
+The language stack alternates mostly linear-attention layers with sparse
+full-attention layers. Figure~\ref{fig:model-structure} shows the exact pattern:
+18 Gated DeltaNet layers and 6 full-attention layers. Supporting this stack
+required a state object for recurrent linear attention, convolution state for
+the Gated DeltaNet block, multimodal RoPE handling, and separate full-attention
+KV cache behavior.
+
+\begin{table}[t]
+  \centering
+  \caption{Selected model and compile-time parameters for the current artifact.}
+  \label{tab:model-config}
+  \begin{tabular}{ll}
+    \toprule
+    Parameter & Value \\
+    \midrule
+    Checkpoint & \texttt{familiar-ai/logos-multitask-qwen3.5-2026-05-03-best} \\
+    Hidden size & 1024 \\
+    Decoder layers & 24 \\
+    Full-attention layers & 6 \\
+    Linear-attention layers & 18 \\
+    Attention heads / KV heads & 8 / 2 \\
+    Head dimension & 256 \\
+    Vocabulary size & 248320 \\
+    Active vocabulary size & 248077 \\
+    Context window & 2048 \\
+    Prefill chunk size & 320 \\
+    Batch size & 1 \\
+    Parameter count & 852,985,920 \\
+    Converted parameter size & 1.589 GB \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Compiler and Runtime Integration}
+
+\subsection{Exported Model Functions}
+
+The final model exports an image embedding function, multimodal prefill
+functions, and multimodal decode functions. For serving, the relevant hot path
+is \texttt{decode\_mrope}, which consumes a one-token embedding, the paged KV
+cache, recurrent state, and multimodal position metadata.
+
+\subsection{Weight Conversion}
+
+The source checkpoint uses Hugging Face safetensors. Conversion maps the model
+weights into MLC tensor-cache shards, rewrites active vocabulary metadata from
+the tokenizer, and preserves tokenizer files in the MLC model directory. A
+separate vLLM preparation helper remaps selected parameter names so the same
+fine-tuned checkpoint can be loaded in the installed vLLM environment.
+
+\subsection{CUDA Graph Capture}
+
+The largest runtime change was making decode replay stable under CUDA graph
+capture. Earlier versions left multiple KV-cache append, metadata, and
+cross-attention calls outside the graph or produced incorrect text when
+capturing unsafe FlashInfer state. The final artifact uses explicit paged
+metadata, stable decode inputs, and relaxed metadata-tuple analysis in the CUDA
+graph rewrite pass. The resulting \texttt{decode\_mrope} path is captured as a
+single graph replay per token.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/runtime_visibility.tex}
+  \caption{CUDA graph capture changes the visibility of runtime work. With graph
+  disabled, Nsight sees hundreds of kernel launches per token. With graph
+  enabled, almost all decode kernels are replayed inside a single graph launch,
+  leaving only a small query-position preparation kernel visible outside the
+  graph.}
+  \label{fig:runtime-visibility}
+\end{figure}
+
+\subsection{Memory Footprint}
+
+The compiled artifact's estimated single-GPU memory usage is dominated by model
+parameters. For the current batch-1 2K-context configuration, the runtime
+reported approximately 1626.943 MB of parameters, 655.335 MB of temporary
+buffer, and 75.150 MB of KV cache.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/memory_usage.tex}
+  \caption{Estimated single-GPU memory components for the current compiled
+  artifact.}
+  \label{fig:memory}
+\end{figure}
+
+\section{Benchmark Methodology}
+
+The benchmark prompt is ``What is in the image?'' on \texttt{kentucky.png},
+with a 512 pixel fitted image size and 128 generated tokens. We report
+generated tokens/s for end-to-end wrapper comparisons and effective decode
+tokens/s for MLC when deferred CPU token commit would otherwise hide queued GPU
+work outside the inner decode timer. The wrappers reject image-grid mismatches
+and generated-token mismatches by default.
+
+\begin{table}[t]
+  \centering
+  \caption{Current parity result on the batch-1 image benchmark.}
+  \label{tab:parity}
+  \begin{tabular}{lrr}
+    \toprule
+    Runtime & Generated tokens/s & Effective decode tokens/s \\
+    \midrule
+    MLC LLM & 414.23 & 446.09 \\
+    vLLM & 413.30 & -- \\
+    Transformers & 65.08 & -- \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[t]
+  \centering
+  \input{figures/throughput_parity.tex}
+  \caption{Current batch-1 parity result. The MLC generated-token metric is
+  directly comparable to the vLLM generated-token metric; the effective decode
+  metric additionally accounts for deferred token-commit synchronization.}
+  \label{fig:throughput}
+\end{figure}
+
+\section{Performance Evolution}
+
+Performance improved incrementally as correctness and runtime boundaries were
+made explicit. Figure~\ref{fig:timeline} plots representative milestones:
+packed Gated DeltaNet support, stable decode inputs, captured cross-attention,
+captured append and metadata paths, and relaxed metadata analysis that merges
+decode into one graph region.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/optimization_timeline.tex}
+  \caption{Representative performance progression across implementation
+  milestones. The vLLM generated-token line is included as the target baseline.}
+  \label{fig:timeline}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{Selected implementation milestones.}
+  \label{tab:milestones}
+  \begin{tabular}{lll}
+    \toprule
+    Milestone & MLC gen. tok/s & Effective decode tok/s \\
+    \midrule
+    Packed GDN path & 403.10 & 433.26 \\
+    Stable decode input & 406.68 & 437.17 \\
+    Cross-attention graph capture & 411.02 & 441.83 \\
+    Append and metadata capture & 410.27 & 441.48 \\
+    Relaxed metadata tuple capture & 414.23 & 446.09 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Kernel Attribution}
+
+Although this report is primarily about model support rather than low-level
+kernel engineering, kernel attribution was necessary to determine whether
+remaining performance differences came from runtime launch overhead or model
+compute. A no-CUDA-graph diagnostic library was compiled so Nsight could see
+internal decode kernels directly. The profile showed approximately 415 kernel
+launches/token without graph capture and one graph replay/token in the
+production artifact.
+
+\begin{figure}[t]
+  \centering
+  \input{figures/kernel_breakdown.tex}
+  \caption{No-graph decode attribution. GEMV/GEMM dominates the batch-1 decode
+  profile, while FlashInfer attention is not the primary cost on this 2K-context
+  workload.}
+  \label{fig:kernel-breakdown}
+\end{figure}
+
+\begin{table}[t]
+  \centering
+  \caption{No-graph kernel-time attribution per decode token.}
+  \label{tab:kernel-breakdown}
+  \begin{tabular}{lrr}
+    \toprule
+    Category & Microseconds/token & Calls/token \\
+    \midrule
+    GEMV/GEMM & 1732.960 & 98.000 \\
+    Other & 255.254 & 169.000 \\
+    Elementwise & 113.838 & 112.000 \\
+    GDN linear-attention & 89.634 & 18.000 \\
+    FlashInfer attention & 51.158 & 12.000 \\
+    KV cache & 7.533 & 6.000 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The production graph-enabled profile exposed only one small query-position
+preparation kernel at about 0.978 microseconds/token outside graph replay.
+This supports the conclusion that the current artifact is already optimized at
+the runtime-launch level; subsequent gains should come from higher-level model
+or compiler specialization, not simply from adding another attention backend.
+
+\section{Correctness and Validation}
+
+Correctness validation focused on matching model semantics before comparing
+speed. The support code includes tests for image-grid parsing, model path
+resolution, vLLM tokenizer compatibility rewriting, benchmark output parsing,
+subprocess failure handling, shell command syntax, Qwen3.5 model export,
+KV-cache metadata behavior, and fixed-canvas image resize parity. The paper
+package itself is generated from local artifacts and records the commands used
+for benchmark reproduction.
+
+\begin{table}[t]
+  \centering
+  \caption{Validation gates used during the implementation.}
+  \label{tab:validation}
+  \begin{tabular}{ll}
+    \toprule
+    Gate & Purpose \\
+    \midrule
+    \texttt{test\_qwen35.py} & Model export and Qwen3.5 frontend behavior \\
+    \texttt{test\_qwen35\_benchmark\_wrapper.py} & MLC/vLLM wrapper parsing and parity checks \\
+    \texttt{test\_compare\_nsys\_decode.py} & Nsight kernel/runtime categorization \\
+    \texttt{bash -n} shell entrypoints & Quoting and semicolon-heavy compile options \\
+    \texttt{check\_qwen35\_im\_parity.sh} & Transformers/MLC/vLLM image path parity \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Lessons Learned}
+
+\paragraph{Apples-to-apples benchmarking came first.}
+Early comparisons were misleading until both paths used the same fine-tuned
+checkpoint, image grid, generated-token count, and EOS behavior. The benchmark
+wrapper's strict default checks were therefore as important as the model code.
+
+\paragraph{Compiler wins depended on runtime contracts.}
+CUDA graph capture improved only when the runtime state consumed by FlashInfer,
+KV-cache metadata, and decode inputs became stable and explicit enough for the
+compiler to reason about. Compiler analysis and runtime object design had to be
+co-designed.
+
+\paragraph{Attention was not the only question.}
+Several attempts to swap or force attention backends produced smaller gains
+than expected, and some fast microkernels did not improve whole-model decode.
+The final result came from making the existing FlashInfer/cuBLAS path coherent
+and graph-safe.
+
+\paragraph{A compiled artifact is a product surface.}
+The support work included tokenizer files, active vocabulary metadata, model
+library naming, shell entrypoints, dry-run compile commands, diagnostic flags,
+and vLLM-compatible checkpoint preparation. These details made the difference
+between a one-off experiment and a reproducible deployment path.
+
+\section{Limitations}
+
+The evaluation is intentionally narrow. It uses one GPU, batch size 1, one
+image, one prompt family, and one fine-tuned checkpoint. It does not evaluate
+multi-request serving, long-context behavior beyond the compiled 2K window,
+quantized accuracy/performance tradeoffs, mobile backends, or general
+vision-language benchmarks. The reported parity should therefore be read as an
+engineering result for a specific deployment target, not as a universal ranking
+of inference systems.
+
+\section{Conclusion}
+
+We added MLC LLM support for a fine-tuned Qwen3.5 0.8B vision-language model
+and brought the batch-1 image decode path to parity with a vLLM baseline on the
+same checkpoint and image grid. The work required model frontend support,
+vision preprocessing parity, Gated DeltaNet state handling, multimodal RoPE
+support, weight conversion, explicit KV-cache metadata, CUDA graph capture, and
+repeatable benchmarking. The outcome demonstrates that compiler-based LLM
+deployment can support non-standard multimodal architectures, but also shows
+that correctness, runtime contracts, and benchmark hygiene are prerequisites for
+meaningful performance claims.
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

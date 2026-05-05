@@ -133,6 +133,9 @@ class ImageDataNode : public DataNode {
   /*! \brief The pixel values. */
   Tensor image;
   int embed_size;
+  int grid_t = 0;
+  int grid_h = 0;
+  int grid_w = 0;
 
   int GetLength() const final;
   ObjectRef GetEmbedding(Model model, ObjectRef* dst = nullptr, int offset = 0) const final;
@@ -148,6 +151,7 @@ class ImageDataNode : public DataNode {
 class ImageData : public Data {
  public:
   explicit ImageData(Tensor image, int embed_size);
+  explicit ImageData(Tensor image, int embed_size, int grid_t, int grid_h, int grid_w);
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(ImageData, Data, ImageDataNode);
 };
@@ -166,6 +170,10 @@ struct SampleResult {
   TokenProbPair sampled_token_id;
   /*! \brief The token id and probability of the tokens with top probabilities. */
   std::vector<TokenProbPair> top_prob_tokens;
+  /*! \brief Optional device tensor containing sampled token ids for fast-path decode. */
+  Tensor sampled_token_ids_device{nullptr};
+  /*! \brief Offset of sampled_token_id inside sampled_token_ids_device. */
+  int sampled_token_ids_device_offset = 0;
 
   /*! \brief Get the sampled token id. */
   int32_t GetTokenId() const;

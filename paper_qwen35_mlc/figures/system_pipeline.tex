@@ -1,0 +1,19 @@
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners=2pt, align=center, minimum height=0.72cm, minimum width=2.3cm, fill=blue!6},
+    opt/.style={draw, rounded corners=2pt, align=center, minimum height=0.72cm, minimum width=2.3cm, fill=green!8},
+    arrow/.style={-Latex, thick}
+]
+\node[box] (hf) {HF checkpoint\\tokenizer/config};
+\node[box, right=0.55cm of hf] (config) {MLC config\\Qwen3.5 parser};
+\node[opt, right=0.55cm of config] (model) {Relax model\\vision + language};
+\node[opt, right=0.55cm of model] (passes) {compile passes\\fusion + graph};
+\node[box, right=0.55cm of passes] (runtime) {.so + tensor\\cache shards};
+\node[box, below=0.6cm of runtime] (serve) {image runner\\MLC engine};
+\node[box, left=0.55cm of serve] (compare) {vLLM / HF\\baselines};
+\draw[arrow] (hf) -- (config);
+\draw[arrow] (config) -- (model);
+\draw[arrow] (model) -- (passes);
+\draw[arrow] (passes) -- (runtime);
+\draw[arrow] (runtime) -- (serve);
+\draw[arrow] (serve) -- (compare);
+\end{tikzpicture}

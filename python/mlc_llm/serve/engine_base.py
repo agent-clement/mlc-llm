@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import json
+import os
 import numbers
 import queue
 import threading
@@ -91,11 +92,16 @@ def _check_engine_config(
             'Please set the "engine_config.mode" to None or set it to the same as the '
             'argument "mode".'
         )
-    if engine_config.kv_cache_page_size != 16:
+    allow_experimental_page_size = (
+        os.environ.get("MLC_ALLOW_EXPERIMENTAL_KV_CACHE_PAGE_SIZE", "0") != "0"
+    )
+    if engine_config.kv_cache_page_size != 16 and not allow_experimental_page_size:
         raise ValueError(
             'KV cache only supports page size 16, while the "kv_cache_page_size" field in '
             f'argument "engine_config" is "{engine_config.kv_cache_page_size}". '
-            'Please set "engine_config.kv_cache_page_size" to 16.'
+            'Please set "engine_config.kv_cache_page_size" to 16. '
+            'For experimental compiled artifacts with a matching page size, set '
+            'MLC_ALLOW_EXPERIMENTAL_KV_CACHE_PAGE_SIZE=1.'
         )
 
 

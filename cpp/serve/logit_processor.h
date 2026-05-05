@@ -12,6 +12,7 @@
 
 #include "../base.h"
 #include "config.h"
+#include "data.h"
 #include "event_trace_recorder.h"
 #include "function_table.h"
 #include "request_state.h"
@@ -67,6 +68,23 @@ class LogitProcessorObj : public Object {
                                         const Array<GenerationConfig>& generation_cfg,
                                         const Array<String>& request_ids,
                                         const std::vector<int>* cum_num_token = nullptr) = 0;
+
+  /*! \brief Return whether the generation configs can use direct greedy argmax. */
+  virtual bool CanSampleGreedy(const Array<GenerationConfig>& generation_cfg) = 0;
+
+  /*! \brief Return whether logits can be bypassed and greedy ids can be sampled from model output. */
+  virtual bool CanBypassLogitsForGreedy(const Array<GenerationConfig>& generation_cfg,
+                                        const Array<RequestModelState>& mstates) = 0;
+
+  /*! \brief Sample token ids from logits by direct argmax. */
+  virtual std::vector<SampleResult> SampleGreedyFromLogits(
+      Tensor logits, const Array<GenerationConfig>& generation_cfg,
+      const Array<String>& request_ids) = 0;
+
+  /*! \brief Sample token ids from logits by direct argmax and keep them on device. */
+  virtual Tensor SampleGreedyTokenIdsDeviceFromLogits(
+      Tensor logits, const Array<GenerationConfig>& generation_cfg,
+      const Array<String>& request_ids) = 0;
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;

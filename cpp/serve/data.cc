@@ -131,6 +131,16 @@ ImageData::ImageData(Tensor image, int embed_size) {
   data_ = std::move(n);
 }
 
+ImageData::ImageData(Tensor image, int embed_size, int grid_t, int grid_h, int grid_w) {
+  ObjectPtr<ImageDataNode> n = tvm::ffi::make_object<ImageDataNode>();
+  n->image = std::move(image);
+  n->embed_size = embed_size;
+  n->grid_t = grid_t;
+  n->grid_h = grid_h;
+  n->grid_w = grid_w;
+  data_ = std::move(n);
+}
+
 int ImageDataNode::GetLength() const { return embed_size; }
 
 ObjectRef ImageDataNode::GetEmbedding(Model model, ObjectRef* dst, int offset) const {
@@ -142,7 +152,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef()
       .def("mlc.serve.ImageData",
            [](Tensor image, int embed_size) { return ImageData(std::move(image), embed_size); })
-      .def("mlc.serve.ImageDataGetImage", [](ImageData data) { return data->image; });
+      .def("mlc.serve.ImageDataWithGrid",
+           [](Tensor image, int embed_size, int grid_t, int grid_h, int grid_w) {
+             return ImageData(std::move(image), embed_size, grid_t, grid_h, grid_w);
+           })
+      .def("mlc.serve.ImageDataGetImage", [](ImageData data) { return data->image; })
+      .def("mlc.serve.ImageDataGetEmbedSize", [](ImageData data) { return data->embed_size; })
+      .def("mlc.serve.ImageDataGetGridTHW",
+           [](ImageData data) { return IntTuple{data->grid_t, data->grid_h, data->grid_w}; });
 }
 
 /****************** SampleResult ******************/

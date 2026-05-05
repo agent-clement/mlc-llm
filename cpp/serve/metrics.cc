@@ -108,7 +108,35 @@ tvm::ffi::json::Object EngineMetrics::AsJSON() const {
   metrics.Set("engine_prefill_time_sum", engine_prefill_time_sum);
   metrics.Set("engine_decode_time_sum", engine_decode_time_sum);
   metrics.Set("engine_jump_forward_time_sum", engine_jump_forward_time_sum);
+  metrics.Set("engine_step_time_sum", engine_step_time_sum);
+  metrics.Set("engine_action_step_time_sum", engine_action_step_time_sum);
+  metrics.Set("engine_postprocess_time_sum", engine_postprocess_time_sum);
+  {
+    tvm::ffi::json::Object action_time_by_index;
+    for (size_t i = 0; i < engine_action_time_by_index.size(); ++i) {
+      if (engine_action_time_by_index[i] == 0.0) continue;
+      std::ostringstream label;
+      label << "sum{action_index=" << i << "}";
+      action_time_by_index.Set(label.str(), engine_action_time_by_index[i]);
+    }
+    metrics.Set("engine_action_time_by_index", action_time_by_index);
+  }
   metrics.Set("prompt_tokens_sum", prompt_tokens_sum);
+  metrics.Set("engine_batch_decode_action_time_sum", engine_batch_decode_action_time_sum);
+  metrics.Set("engine_batch_decode_prepare_time_sum", engine_batch_decode_prepare_time_sum);
+  metrics.Set("engine_batch_decode_deferred_commit_time_sum",
+              engine_batch_decode_deferred_commit_time_sum);
+  metrics.Set("engine_batch_decode_deferred_commit_copy_sync_time_sum",
+              engine_batch_decode_deferred_commit_copy_sync_time_sum);
+  metrics.Set("engine_batch_decode_deferred_commit_cpu_time_sum",
+              engine_batch_decode_deferred_commit_cpu_time_sum);
+  metrics.Set("engine_batch_decode_model_time_sum", engine_batch_decode_model_time_sum);
+  metrics.Set("engine_batch_decode_logits_update_time_sum",
+              engine_batch_decode_logits_update_time_sum);
+  metrics.Set("engine_batch_decode_probs_time_sum", engine_batch_decode_probs_time_sum);
+  metrics.Set("engine_batch_decode_sample_time_sum", engine_batch_decode_sample_time_sum);
+  metrics.Set("engine_batch_decode_device_token_copy_time_sum",
+              engine_batch_decode_device_token_copy_time_sum);
   metrics.Set("completion_tokens_sum", completion_tokens_sum);
   metrics.Set("prefill_tokens_sum", prefill_tokens_sum);
   metrics.Set("decode_tokens_sum", decode_tokens_sum);
@@ -165,6 +193,21 @@ void EngineMetrics::Reset() {
   engine_prefill_time_sum = 0.0;
   engine_decode_time_sum = 0.0;
   engine_jump_forward_time_sum = 0;
+  engine_step_time_sum = 0.0;
+  engine_action_step_time_sum = 0.0;
+  engine_postprocess_time_sum = 0.0;
+  engine_action_time_by_index.clear();
+  engine_action_time_by_index.resize(8, 0.0);
+  engine_batch_decode_action_time_sum = 0.0;
+  engine_batch_decode_prepare_time_sum = 0.0;
+  engine_batch_decode_deferred_commit_time_sum = 0.0;
+  engine_batch_decode_deferred_commit_copy_sync_time_sum = 0.0;
+  engine_batch_decode_deferred_commit_cpu_time_sum = 0.0;
+  engine_batch_decode_model_time_sum = 0.0;
+  engine_batch_decode_logits_update_time_sum = 0.0;
+  engine_batch_decode_probs_time_sum = 0.0;
+  engine_batch_decode_sample_time_sum = 0.0;
+  engine_batch_decode_device_token_copy_time_sum = 0.0;
   prompt_tokens_sum = 0;
   completion_tokens_sum = 0;
   prefill_tokens_sum = 0;

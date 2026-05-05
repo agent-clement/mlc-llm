@@ -188,7 +188,11 @@ class Conversation(BaseModel):
                 elif item["type"] == "image_url":
                     assert config is not None, "Model config is required"
                     image_url = _get_url_from_item(item)
+                    if config.get("model_type") == "qwen3_5":
+                        message_list.append("<|vision_start|>")
                     message_list.append(data.ImageData.from_url(image_url, config))
+                    if config.get("model_type") == "qwen3_5":
+                        message_list.append("<|vision_end|>")
                     message_list.append("\n")
                 else:
                     raise ValueError(f"Unsupported content type: {item['type']}")

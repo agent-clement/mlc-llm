@@ -95,7 +95,7 @@ Array<EngineAction> CreateEngineActions(Array<Model> models, EngineConfig engine
                                                   engine_config, trace_recorder)},
                      /*batch_decode_actions=*/
                      {EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler,
-                                                engine_config, trace_recorder)},
+                                                model_workspaces, engine_config, trace_recorder)},
                      engine_config)};
     }
   } else if (model_metadata.disaggregation) {
@@ -106,8 +106,8 @@ Array<EngineAction> CreateEngineActions(Array<Model> models, EngineConfig engine
                                                engine_config,     //
                                                model_configs,     //
                                                trace_recorder),
-               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler, engine_config,
-                                         trace_recorder)};
+               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler,
+                                         model_workspaces, engine_config, trace_recorder)};
   } else {
     // The normal mode.
     actions = {EngineAction::NewRequestPrefill(models,            //
@@ -118,8 +118,8 @@ Array<EngineAction> CreateEngineActions(Array<Model> models, EngineConfig engine
                                                model_configs,     //
                                                trace_recorder),
                EngineAction::BatchJumpForward(models, tokenizer, trace_recorder),
-               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler, engine_config,
-                                         trace_recorder)};
+               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler,
+                                         model_workspaces, engine_config, trace_recorder)};
   }
 
   if (model_metadata.disaggregation) {
@@ -243,6 +243,12 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
                            Optional<EventTraceRecorder> trace_recorder) {
   NVTXScopedRange nvtx_scope("EngineAction postproc");
   int num_requests = requests.size();
+  Array<String> request_ids;
+  request_ids.reserve(num_requests);
+  for (Request request : requests) {
+    request_ids.push_back(request->id);
+  }
+  RECORD_EVENT(trace_recorder, request_ids, "start action postprocess");
   estate->postproc_workspace.finished_rsentries.clear();
   estate->postproc_workspace.callback_delta_outputs.clear();
   estate->postproc_workspace.finished_rsentries.reserve(num_requests);
@@ -258,7 +264,9 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
     RequestStreamOutput stream_output = rstate->postproc_states.GetStreamOutput();
     for (int i = 0; i < n; ++i) {
       const RequestStateEntry& rsentry = n == 1 ? rstate->entries[0] : rstate->entries[i + 1];
+      RECORD_EVENT(trace_recorder, request->id, "start get delta request return");
       rsentry->GetDeltaRequestReturn(tokenizer, max_single_sequence_length, &stream_output, i);
+      RECORD_EVENT(trace_recorder, request->id, "finish get delta request return");
       if (stream_output->group_finish_reason[i].has_value()) {
         invoke_callback = true;
         estate->postproc_workspace.finished_rsentries.push_back(rsentry);
@@ -275,6 +283,7 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
     }
 
     // Update prefix cache and metrics.
+    RECORD_EVENT(trace_recorder, request->id, "start postprocess prefix cache update");
     for (const RequestStateEntry& rsentry : rstate->entries) {
       std::vector<int32_t>& token_ids = rsentry->token_ids_for_prefix_cache_update;
       token_ids.clear();
@@ -303,6 +312,7 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
         estate->prefix_cache->ExtendSequence(rsentry->mstates[0]->internal_id, token_ids);
       }
     }
+    RECORD_EVENT(trace_recorder, request->id, "finish postprocess prefix cache update");
 
     // - For all disaggregation requests with "remote_send",
     // if it does not appear in the waiting queue, it means the prefill has been finished.
@@ -317,15 +327,20 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
     }
   }
 
+  RECORD_EVENT(trace_recorder, request_ids, "start process finished requests");
   ProcessFinishedRequestStateEntries(estate->postproc_workspace.finished_rsentries, estate, models,
                                      max_single_sequence_length, draft_token_workspace_manager,
                                      &estate->postproc_workspace.callback_delta_outputs);
+  RECORD_EVENT(trace_recorder, request_ids, "finish process finished requests");
 
   if (!estate->postproc_workspace.callback_delta_outputs.empty()) {
     NVTXScopedRange nvtx_scope("Call request stream callback");
+    RECORD_EVENT(trace_recorder, request_ids, "start request stream callback");
     // - Invoke the stream callback function once for all collected requests.
     request_stream_callback(estate->postproc_workspace.callback_delta_outputs);
+    RECORD_EVENT(trace_recorder, request_ids, "finish request stream callback");
   }
+  RECORD_EVENT(trace_recorder, request_ids, "finish action postprocess");
 }  // namespace serve
 
 RequestStateEntry PreemptLastRunningRequestStateEntry(

@@ -198,7 +198,8 @@ Result<ChatCompletionMessage> ChatCompletionMessage::FromJSON(
       tvm::ffi::json::Object item_obj = item.cast<tvm::ffi::json::Object>();
       std::unordered_map<std::string, std::string> item_map;
       for (const auto& [key, value] : item_obj) {
-        item_map[key.cast<tvm::ffi::String>()] = tvm::ffi::json::Stringify(value);
+        item_map[key.cast<tvm::ffi::String>()] =
+            value.try_cast<std::string>().value_or(tvm::ffi::json::Stringify(value));
       }
       parts.push_back(std::move(item_map));
     }

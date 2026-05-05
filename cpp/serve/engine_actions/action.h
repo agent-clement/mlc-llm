@@ -110,6 +110,7 @@ class EngineAction : public ObjectRef {
    */
   static EngineAction BatchDecode(Array<Model> models, Tokenizer tokenizer,
                                   LogitProcessor logit_processor, Sampler sampler,
+                                  std::vector<ModelWorkspace> model_workspaces,
                                   EngineConfig engine_config,
                                   Optional<EventTraceRecorder> trace_recorder);
 

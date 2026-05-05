@@ -1,0 +1,14 @@
+\begin{tikzpicture}[
+    box/.style={draw, rounded corners=2pt, align=center, minimum height=0.68cm, minimum width=2.0cm, fill=purple!6},
+    arrow/.style={-Latex, thick}
+]
+\node[box] (img) {image\\512$\times$512};
+\node[box, right=0.35cm of img] (proc) {processor\\grid 1$\times$32$\times$32};
+\node[box, right=0.35cm of proc] (vision) {vision tower\\1024 patches};
+\node[box, right=0.35cm of vision] (merge) {spatial merge\\256 image tokens};
+\node[box, right=0.35cm of merge] (lm) {mrope prefill\\+ decode};
+\draw[arrow] (img) -- (proc);
+\draw[arrow] (proc) -- (vision);
+\draw[arrow] (vision) -- (merge);
+\draw[arrow] (merge) -- (lm);
+\end{tikzpicture}

@@ -10,6 +10,7 @@ HF weight layout (under model.language_model.):
     model.language_model.layers.{i}.linear_attn.in_proj_z.weight
     model.language_model.layers.{i}.linear_attn.in_proj_a.weight
     model.language_model.layers.{i}.linear_attn.in_proj_b.weight
+      -> packed into MLC linear_attn.in_proj.weight
     model.language_model.layers.{i}.linear_attn.out_proj.weight
     model.language_model.layers.{i}.linear_attn.conv1d.weight
     model.language_model.layers.{i}.linear_attn.norm.weight
@@ -20,7 +21,8 @@ HF weight layout (under model.language_model.):
     model.language_model.layers.{i}.self_attn.q_proj.weight
     ...
 
-  Vision/MTP weights are ignored (text backbone only).
+  Vision weights are nested under model.visual.*.
+  MTP weights are ignored.
 """
 
 import functools
@@ -46,9 +48,15 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
 
     mapping = ExternMapping()
 
-    # HF prefix: Qwen3.5 is a VLM, text weights nested under model.language_model.
-    # MLC model uses model. prefix directly.
-    hf = "model.language_model"
+    # HF prefix: Qwen3.5 is a VLM, text weights are usually nested under
+    # `model.language_model`. Unsloth-saved checkpoints add another wrapper
+    # around the language model and keep vision weights under `model.language_model.visual`.
+    if model_config.kwargs.get("unsloth_fixed", False):
+        hf = "model.language_model.language_model.language_model"
+        hf_visual = "model.language_model.visual"
+    else:
+        hf = "model.language_model"
+        hf_visual = "model.visual"
 
     layer_types = model_config.layer_types()
     for i in range(model_config.num_hidden_layers):
@@ -76,14 +84,25 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
             mlc_lin = f"model.layers.{i}.linear_attn"
             hf_lin = f"{hf}.layers.{i}.linear_attn"
 
-            # in_proj_qkv — maps directly (already fused in HF)
-            mlc_name = f"{mlc_lin}.in_proj_qkv.weight"
+            # Pack the four input projections. This reduces decode-time launch
+            # overhead by turning qkv/z/alpha/beta matmuls into one matmul.
+            mlc_name = f"{mlc_lin}.in_proj.weight"
             if mlc_name in named_parameters:
                 mlc_param = named_parameters[mlc_name]
                 mapping.add_mapping(
                     mlc_name,
-                    [f"{hf_lin}.in_proj_qkv.weight"],
-                    functools.partial(lambda x, dtype: x.astype(dtype), dtype=mlc_param.dtype),
+                    [
+                        f"{hf_lin}.in_proj_qkv.weight",
+                        f"{hf_lin}.in_proj_z.weight",
+                        f"{hf_lin}.in_proj_a.weight",
+                        f"{hf_lin}.in_proj_b.weight",
+                    ],
+                    functools.partial(
+                        lambda qkv, z, a, b, dtype: np.concatenate(
+                            [qkv, z, a, b], axis=0
+                        ).astype(dtype),
+                        dtype=mlc_param.dtype,
+                    ),
                 )
 
             # A_log and dt_bias — no .weight suffix in HF
@@ -129,6 +148,8 @@ def huggingface(model_config: Qwen35Config, quantization: Quantization) -> Exter
         """Convert MLC param name to HF param name by adding language_model prefix."""
         if mlc_name.startswith("model."):
             return mlc_name.replace("model.", f"{hf}.", 1)
+        if mlc_name.startswith("visual."):
+            return mlc_name.replace("visual.", f"{hf_visual}.", 1)
         return mlc_name
 
     def _is_rmsnorm_weight(name: str) -> bool:

@@ -56,6 +56,36 @@ def _reorder_cos_sin(
     return op.concat(reordered, dim=-1)
 
 
+def _interleave_mrope_freqs(freqs: Tensor, mrope_section: Sequence[int]) -> Tensor:
+    """Apply Qwen3.5 interleaved THW MRoPE layout to frequency tensors.
+
+    HF starts with temporal frequencies, then overwrites positions 1::3 with
+    height and 2::3 with width within the configured rotary section.
+    """
+
+    if len(mrope_section) != 3:
+        raise ValueError(f"mrope_section must contain 3 integers, got {mrope_section}.")
+    height_limit = int(mrope_section[1]) * 3
+    width_limit = int(mrope_section[2]) * 3
+
+    def compute(x: te.Tensor):
+        def fcompute(batch: tirx.Var, seq: tirx.Var, dim: tirx.Var):
+            axis = tirx.if_then_else(
+                tirx.all(dim % 3 == 1, dim < height_limit),
+                tirx.const(1, "int32"),
+                tirx.if_then_else(
+                    tirx.all(dim % 3 == 2, dim < width_limit),
+                    tirx.const(2, "int32"),
+                    tirx.const(0, "int32"),
+                ),
+            )
+            return x[axis, batch, seq, dim]
+
+        return te.compute((x.shape[1], x.shape[2], x.shape[3]), fcompute, name="interleaved_mrope")
+
+    return op.tensor_expr_op(compute, "interleaved_mrope", [freqs])
+
+
 class MultimodalRotaryEmbedding(nn.Module):
     """Generate cosine/sine tables for multimodal rotary embeddings."""
 
@@ -65,6 +95,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         theta: float,
         mrope_section: Sequence[int],
         attention_scaling: float = 1.0,
+        interleaved: bool = False,
     ) -> None:
         if head_dim % 2 != 0:
             raise ValueError(f"head_dim must be even for RoPE, got {head_dim}.")
@@ -72,12 +103,18 @@ class MultimodalRotaryEmbedding(nn.Module):
         self.theta = theta
         self.attention_scaling = attention_scaling
         self.mrope_section = tuple(mrope_section)
+        self.interleaved = interleaved
         self._inv_freq = 1.0 / (
             theta ** (np.arange(0, head_dim, 2, dtype="float32") / np.float32(head_dim))
         )
 
     def forward(self, reference: Tensor, position_ids: Tensor) -> Tuple[Tensor, Tensor]:  # noqa: UP006
-        """Return ``(cos, sin)`` with shape ``(3, batch, seq, head_dim)``."""
+        """Return ``(cos, sin)`` rotary tables.
+
+        Non-interleaved mode returns ``(3, batch, seq, head_dim)`` and lets
+        ``apply_multimodal_rotary_pos_emb`` pick T/H/W chunks. Interleaved mode
+        applies the Qwen3.5 THWTHW layout here and returns ``(batch, seq, head_dim)``.
+        """
         if len(position_ids.shape) != 3:
             raise ValueError(
                 "position_ids must be rank-3 with either "
@@ -103,6 +140,8 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         freqs = op.matmul(inv_freq_tensor.astype("float32"), pos_tensor.astype("float32"))
         freqs = op.permute_dims(freqs, axes=[0, 1, 3, 2])
+        if self.interleaved:
+            freqs = _interleave_mrope_freqs(freqs, self.mrope_section)
         emb = op.concat([freqs, freqs], dim=-1)
 
         def _apply_trig(func_name: str) -> Tensor:
@@ -127,12 +166,17 @@ def apply_multimodal_rotary_pos_emb(
     sin: Tensor,
     mrope_section: Sequence[int],
     unsqueeze_dim: int = 2,
+    interleaved: bool = False,
 ) -> Tuple[Tensor, Tensor]:  # noqa: UP006
     """Apply multimodal rotary embedding to query and key tensors."""
 
-    split_sizes = _repeat_mrope_section(mrope_section)
-    reordered_cos = _reorder_cos_sin(cos, split_sizes)
-    reordered_sin = _reorder_cos_sin(sin, split_sizes)
+    if interleaved:
+        reordered_cos = cos
+        reordered_sin = sin
+    else:
+        split_sizes = _repeat_mrope_section(mrope_section)
+        reordered_cos = _reorder_cos_sin(cos, split_sizes)
+        reordered_sin = _reorder_cos_sin(sin, split_sizes)
     cos_term = op.unsqueeze(reordered_cos, dim=unsqueeze_dim)
     sin_term = op.unsqueeze(reordered_sin, dim=unsqueeze_dim)
     cos_term = cos_term.astype(q.dtype)

@@ -211,18 +211,28 @@ void FunctionTable::_InitFunctions() {
   this->single_batch_decode_func_ = mod_get_func("decode");
   this->single_batch_extend_func_ = mod_get_func("extend");
   this->prefill_func_ = mod_get_func("batch_prefill");
+  this->prefill_mrope_func_ = mod_get_func("batch_prefill_mrope");
   this->decode_func_ = mod_get_func("batch_decode");
+  this->decode_mrope_func_ = mod_get_func("batch_decode_mrope");
+  this->single_batch_decode_mrope_func_ = mod_get_func("decode_mrope");
+  this->single_batch_decode_mrope_with_query_positions_func_ =
+      mod_get_func("decode_mrope_with_query_positions");
   this->extend_func_ = mod_get_func("batch_extend");
   this->verify_func_ = mod_get_func("batch_verify");
+  this->verify_mrope_func_ = mod_get_func("batch_verify_mrope");
   this->single_batch_prefill_to_last_hidden_func_ = mod_get_func("prefill_to_last_hidden_states");
   this->single_batch_decode_to_last_hidden_func_ = mod_get_func("decode_to_last_hidden_states");
+  this->single_batch_decode_mrope_to_last_hidden_func_ =
+      mod_get_func("decode_mrope_to_last_hidden_states");
   this->prefill_to_last_hidden_func_ = mod_get_func("batch_prefill_to_last_hidden_states");
   this->decode_to_last_hidden_func_ = mod_get_func("batch_decode_to_last_hidden_states");
+  this->decode_mrope_to_last_hidden_func_ = mod_get_func("batch_decode_mrope_to_last_hidden_states");
   this->verify_to_last_hidden_func_ = mod_get_func("batch_verify_to_last_hidden_states");
   this->fuse_embed_hidden_func_ = mod_get_func("fuse_embed_hidden_states");
   Module mod = this->use_disco ? this->disco_mod.value()->DebugGetFromRemote(0).cast<Module>()
                                : this->local_vm.value();
   this->get_logits_func_ = mod_get_func("get_logits");
+  this->get_token_ids_func_ = mod->GetFunction("get_token_ids", true).value_or(Function(nullptr));
   this->batch_get_logits_func_ = mod_get_func("batch_get_logits");
   this->batch_select_last_hidden_func_ = mod_get_func("batch_select_last_hidden_states");
   this->softmax_func_ =
@@ -235,17 +245,25 @@ void FunctionTable::_InitFunctions() {
       mod->GetFunction("apply_bitmask_inplace", true).value_or(Function(nullptr));
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
   this->cuda_graph_alloc_init_func_ = mod_get_func("cuda_graph_alloc_init");
-  this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
-  if (this->model_metadata_.sliding_window_size != -1 || !this->create_kv_cache_func_.defined()) {
-    Function f_create_rnn_state = mod_get_func("create_rnn_state");
-    if (this->model_metadata_.kv_state_kind == KVStateKind::kHybrid) {
-      // Hybrid models need both KV cache and RNN state.
-      this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
-      this->create_rnn_state_func_ = f_create_rnn_state;
-    } else if (f_create_rnn_state.defined()) {
-      this->create_kv_cache_func_ = f_create_rnn_state;
-    } else {
-      this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+  Function f_create_flashinfer_kv_cache = mod_get_func("create_flashinfer_paged_kv_cache");
+  Function f_create_tir_kv_cache = mod_get_func("create_tir_paged_kv_cache");
+  Function f_create_rnn_state = mod_get_func("create_rnn_state");
+  if (this->model_metadata_.kv_state_kind == KVStateKind::kHybrid) {
+    // Hybrid models need both an attention KV cache and a recurrent state. Use FlashInfer for
+    // the attention cache when available, but always initialize the recurrent-state creator.
+    this->create_kv_cache_func_ =
+        (this->model_metadata_.sliding_window_size == -1 && f_create_flashinfer_kv_cache.defined())
+            ? f_create_flashinfer_kv_cache
+            : f_create_tir_kv_cache;
+    this->create_rnn_state_func_ = f_create_rnn_state;
+  } else {
+    this->create_kv_cache_func_ = f_create_flashinfer_kv_cache;
+    if (this->model_metadata_.sliding_window_size != -1 || !this->create_kv_cache_func_.defined()) {
+      if (f_create_rnn_state.defined()) {
+        this->create_kv_cache_func_ = f_create_rnn_state;
+      } else {
+        this->create_kv_cache_func_ = f_create_tir_kv_cache;
+      }
     }
   }
   this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
@@ -264,11 +282,14 @@ void FunctionTable::_InitFunctions() {
       get_global_func("vm.builtin.attention_kv_cache_commit_accepted_token_tree_nodes");
   this->kv_cache_get_num_available_pages_func_ =
       Function::GetGlobalRequired("vm.builtin.attention_kv_cache_get_num_available_pages");
+  this->kv_cache_get_query_positions_func_ =
+      get_global_func("vm.builtin.attention_kv_cache_get_query_positions");
   this->kv_cache_get_total_sequence_length_func_ =
       Function::GetGlobalRequired("vm.builtin.attention_kv_cache_get_total_sequence_length");
   if (Sampler::SupportGPUSampler(local_gpu_device)) {
     gpu_multinomial_from_uniform_func_ =
         mod->GetFunction("multinomial_from_uniform", true).value_or(Function(nullptr));
+    gpu_argmax_logits_func_ = mod->GetFunction("argmax_logits", true).value_or(Function(nullptr));
     gpu_argsort_probs_func_ = mod->GetFunction("argsort_probs", true).value_or(Function(nullptr));
     gpu_sample_with_top_p_func_ =
         mod->GetFunction("sample_with_top_p", true).value_or(Function(nullptr));

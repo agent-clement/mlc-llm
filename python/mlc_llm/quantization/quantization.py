@@ -147,6 +147,14 @@ QUANTIZATION: Dict[str, Quantization] = {  # noqa: UP006
         storage_dtype="int8",
         model_dtype="float16",
     ),
+    "q4f16_ft64": FTQuantize(
+        name="q4f16_ft64",
+        kind="ft-quant",
+        quantize_dtype="int4",
+        storage_dtype="int8",
+        model_dtype="float16",
+        group_size=64,
+    ),
     "e5m2_e5m2_f16": PerTensorQuantize(
         name="e5m2_e5m2_f16",
         kind="per-tensor-quant",

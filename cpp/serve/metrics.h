@@ -172,6 +172,34 @@ struct EngineMetrics {
   double engine_decode_time_sum = 0;
   /*! \brief The total engine time on jump-forward prediction. */
   double engine_jump_forward_time_sum = 0;
+  /*! \brief The total wall-clock time spent inside Engine::Step. */
+  double engine_step_time_sum = 0;
+  /*! \brief The total wall-clock time spent running engine actions. */
+  double engine_action_step_time_sum = 0;
+  /*! \brief The total wall-clock time spent in action postprocessing. */
+  double engine_postprocess_time_sum = 0;
+  /*! \brief The total wall-clock time spent in each action slot. */
+  std::vector<double> engine_action_time_by_index = std::vector<double>(8, 0.0);
+  /*! \brief The total wall-clock time spent inside the BatchDecode action. */
+  double engine_batch_decode_action_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent preparing BatchDecode inputs. */
+  double engine_batch_decode_prepare_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent committing deferred BatchDecode tokens. */
+  double engine_batch_decode_deferred_commit_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent copying/syncing deferred BatchDecode tokens. */
+  double engine_batch_decode_deferred_commit_copy_sync_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent appending deferred BatchDecode tokens on CPU. */
+  double engine_batch_decode_deferred_commit_cpu_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent in BatchDecode model compute. */
+  double engine_batch_decode_model_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent in BatchDecode logits processing. */
+  double engine_batch_decode_logits_update_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent computing BatchDecode probabilities. */
+  double engine_batch_decode_probs_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent sampling BatchDecode tokens. */
+  double engine_batch_decode_sample_time_sum = 0.0;
+  /*! \brief The total wall-clock time spent copying sampled device tokens inside BatchDecode. */
+  double engine_batch_decode_device_token_copy_time_sum = 0.0;
   /*! \brief The total number of request input tokens. */
   int64_t prompt_tokens_sum = 0;
   /*! \brief The total number of request output tokens */

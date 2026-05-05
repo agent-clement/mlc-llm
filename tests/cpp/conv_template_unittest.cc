@@ -121,8 +121,43 @@ void _TestConvTemplateLoadJSONPartsContent() {
   ASSERT_EQ(conv.stop_token_ids.at(0), 50256);
 }
 
+void _TestConvTemplateLoadJSONNestedImageURLContent() {
+  std::string conv_template =
+      "{\n"
+      "    \"name\": \"test\",\n"
+      "    \"system_template\": \"{system_message}\",\n"
+      "    \"system_message\": \"\",\n"
+      "    \"roles\": {\n"
+      "      \"user\": \"Instruct\",\n"
+      "      \"assistant\": \"Output\"\n"
+      "    },\n"
+      "    \"role_templates\": {\n"
+      "      \"user\": \"{user_message}\",\n"
+      "      \"assistant\": \"{assistant_message}\"\n"
+      "    },\n"
+      "    \"messages\": [[\"Instruct\", "
+      "    [{\"type\": \"text\", \"text\": \"What's in the image?\"},\n"
+      "     {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://example.com/image.jpg\"}}]\n"
+      "    ]],\n"
+      "    \"seps\": [\"\\n\"],\n"
+      "    \"role_content_sep\": \": \",\n"
+      "    \"role_empty_sep\": \":\"\n"
+      "}";
+
+  auto res = Conversation::FromJSON(conv_template).IsOk();
+  ASSERT_TRUE(res);
+  const Conversation& conv = Conversation::FromJSON(conv_template).Unwrap();
+  ASSERT_EQ(conv.messages.at(0).content.Parts().at(1).at("type"), "image_url");
+  const std::string& image_url = conv.messages.at(0).content.Parts().at(1).at("image_url");
+  ASSERT_NE(image_url.find("\"url\""), std::string::npos);
+  ASSERT_NE(image_url.find("https://example.com/image.jpg"), std::string::npos);
+}
+
 TEST(JsonFFIConvTest, LoadJSONTextContentTest) { _TestConvTemplateLoadJSONTextContent(); }
 TEST(JsonFFIConvTest, LoadJSONPartsContentTest) { _TestConvTemplateLoadJSONPartsContent(); }
+TEST(JsonFFIConvTest, LoadJSONNestedImageURLContentTest) {
+  _TestConvTemplateLoadJSONNestedImageURLContent();
+}
 
 }  // namespace json_ffi
 }  // namespace llm

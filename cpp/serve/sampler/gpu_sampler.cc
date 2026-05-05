@@ -196,6 +196,19 @@ class GPUSampler : public SamplerObj {
                                  generation_cfg, rngs, /*top_p_applied=*/true);
   }
 
+  bool SupportsDeviceTokenIds() final { return true; }
+
+  Tensor BatchSampleTokenIdsDeviceAfterTopP(
+      Tensor probs_on_device,                         //
+      const std::vector<int>& sample_indices,         //
+      const Array<String>& request_ids,               //
+      const Array<GenerationConfig>& generation_cfg,  //
+      const std::vector<RandomGenerator*>& rngs) final {
+    NVTXScopedRange nvtx_scope("BatchSampleTokenIdsDeviceAfterTopP");
+    return BatchSampleTokenIdsDeviceImpl(std::move(probs_on_device), sample_indices, request_ids,
+                                         generation_cfg, rngs, /*top_p_applied=*/true);
+  }
+
   std::pair<std::vector<std::vector<SampleResult>>, std::vector<int>>
   BatchVerifyDraftTokensWithProbAfterTopP(
       Tensor probs_on_device, const Array<String>& request_ids,
@@ -325,7 +338,8 @@ class GPUSampler : public SamplerObj {
       auto host_arrays = CopyArraysToCPU(device_arrays, num_sequence, need_prob_values,
                                          top_prob_offset_indptr.back());
       additional_sample_result =
-          CollectSampleResult(host_arrays, num_sequence, need_prob_values, top_prob_offset_indptr);
+          CollectSampleResult(device_arrays[0], host_arrays, num_sequence, need_prob_values,
+                              top_prob_offset_indptr);
     }
 
     std::vector<int> last_accepted_tree_node;
@@ -405,8 +419,46 @@ class GPUSampler : public SamplerObj {
     return sample_results;
   }
 
+  Tensor BatchSampleTokenIdsDeviceImpl(Tensor probs_on_device,                         //
+                                       const std::vector<int>& sample_indices,         //
+                                       const Array<String>& request_ids,               //
+                                       const Array<GenerationConfig>& generation_cfg,  //
+                                       const std::vector<RandomGenerator*>& rngs,      //
+                                       bool top_p_applied) {
+    RECORD_EVENT(trace_recorder_, request_ids, "start device token sampling");
+    TVM_FFI_ICHECK_EQ(probs_on_device->ndim, 2);
+    TVM_FFI_ICHECK_EQ(probs_on_device->device.device_id, device_.device_id);
+    TVM_FFI_ICHECK_EQ(probs_on_device->device.device_type, device_.device_type);
+    int num_samples = sample_indices.size();
+    int num_probs = probs_on_device->shape[0];
+    int vocab_size = probs_on_device->shape[1];
+    TVM_FFI_ICHECK_EQ(request_ids.size(), num_samples);
+    TVM_FFI_ICHECK_EQ(generation_cfg.size(), num_samples);
+    TVM_FFI_ICHECK_EQ(rngs.size(), num_samples);
+    TVM_FFI_ICHECK_LE(num_samples, max_num_sample_);
+
+    auto uniform_samples_device = GenerateUniformSamples(rngs, num_samples);
+    auto sample_indices_device = CopySampleIndicesToGPU(sample_indices);
+
+    bool need_top_p = false;
+    if (!top_p_applied) {
+      need_top_p = CheckTopP(generation_cfg, sample_indices, num_probs, num_samples, vocab_size);
+    }
+    std::vector<int> top_prob_offset_indptr;
+    bool need_prob_values = CheckProbValues(generation_cfg, sample_indices, num_probs, num_samples,
+                                            vocab_size, &top_prob_offset_indptr);
+    TVM_FFI_ICHECK(!need_prob_values)
+        << "Device-only sampling is only valid when logprobs/top_logprobs are disabled.";
+    std::vector<Tensor> device_arrays =
+        SampleOnGPU(probs_on_device, uniform_samples_device, sample_indices_device, need_top_p,
+                    /*need_prob_values=*/false, num_probs, top_prob_offset_indptr);
+    RECORD_EVENT(trace_recorder_, request_ids, "finish device token sampling");
+    return device_arrays[0];
+  }
+
   /*! \brief Collect the sampling results from the computed Tensor results. */
-  std::vector<SampleResult> CollectSampleResult(const std::vector<Tensor>& host_arrays,
+  std::vector<SampleResult> CollectSampleResult(Tensor sampled_token_ids_device,
+                                                const std::vector<Tensor>& host_arrays,
                                                 int num_samples, bool need_prob_values,
                                                 const std::vector<int> top_prob_offset_indptr) {
     const int* p_sampled_token_ids = static_cast<const int*>(host_arrays[0]->data);
@@ -429,8 +481,10 @@ class GPUSampler : public SamplerObj {
       for (int j = top_prob_offset_indptr[i]; j < top_prob_offset_indptr[i + 1]; ++j) {
         top_prob_tokens.emplace_back(p_top_prob_indices[j], p_top_prob_probs[j]);
       }
-      sample_results.push_back(
-          SampleResult{{p_sampled_token_ids[i], sampled_prob}, top_prob_tokens});
+      SampleResult sample_result{{p_sampled_token_ids[i], sampled_prob}, top_prob_tokens};
+      sample_result.sampled_token_ids_device = sampled_token_ids_device;
+      sample_result.sampled_token_ids_device_offset = i;
+      sample_results.push_back(std::move(sample_result));
     }
     return sample_results;
   }
@@ -471,7 +525,8 @@ class GPUSampler : public SamplerObj {
                                                       top_prob_offset_indptr.back());
 
     // - Collect the sampling results.
-    return CollectSampleResult(host_arrays, num_samples, need_prob_values, top_prob_offset_indptr);
+    return CollectSampleResult(device_arrays[0], host_arrays, num_samples, need_prob_values,
+                               top_prob_offset_indptr);
   }
 
   /*! \brief Generate num_samples uniform random numbers, and copy them to GPU. */
@@ -677,7 +732,7 @@ class GPUSampler : public SamplerObj {
       TVM_FFI_ICHECK_EQ(sampled_probs_device->shape[0], num_samples);
       TVM_FFI_ICHECK_EQ(top_prob_probs_device->shape[0], num_top_probs);
       TVM_FFI_ICHECK_EQ(top_prob_indices_device->shape[0], num_top_probs);
-      sampled_probs_host = sampled_probs_host_.CreateView({num_samples}, dtype_i32_);
+      sampled_probs_host = sampled_probs_host_.CreateView({num_samples}, dtype_f32_);
       top_prob_probs_host = top_prob_probs_host_.CreateView({num_top_probs}, dtype_f32_);
       top_prob_indices_host = top_prob_indices_host_.CreateView({num_top_probs}, dtype_i32_);
       CopyArray(/*src=*/sampled_probs_device, /*dst=*/sampled_probs_host, compute_stream_);
