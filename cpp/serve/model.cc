@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -173,11 +174,19 @@ class ModelImpl : public ModelObj {
         << "`image_embed` function is not found in the model. ";
 
     int tmp_h = 0, tmp_w = 0;
-    CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    if (this->model_type_ == "qwen3_5") {
+      CalculateQwen35ResizeShape(image, qwen35_image_resize_config_, &tmp_h, &tmp_w);
+    } else {
+      CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    }
     Shape resize_h = {tmp_h};
     Shape resize_w = {tmp_w};
 
-    CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    if (this->model_type_ == "qwen3_5") {
+      CalculateQwen35CropShape(image, qwen35_image_resize_config_, &tmp_h, &tmp_w);
+    } else {
+      CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    }
     Shape crop_h = {tmp_h};
     Shape crop_w = {tmp_w};
 
@@ -1796,6 +1805,28 @@ class ModelImpl : public ModelObj {
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
     this->model_type_ = json::Lookup<std::string>(config, "model_type");
+    if (this->model_type_ == "qwen3_5") {
+      std::optional<tvm::ffi::json::Object> model_config =
+          json::LookupOptional<tvm::ffi::json::Object>(config, "model_config");
+      if (model_config.has_value()) {
+        std::optional<tvm::ffi::json::Object> vision_config =
+            json::LookupOptional<tvm::ffi::json::Object>(*model_config, "vision_config");
+        if (vision_config.has_value()) {
+          qwen35_image_resize_config_.patch_size = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "patch_size",
+                                             qwen35_image_resize_config_.patch_size));
+          qwen35_image_resize_config_.spatial_merge_size = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "spatial_merge_size",
+                                             qwen35_image_resize_config_.spatial_merge_size));
+          qwen35_image_resize_config_.min_pixels = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "min_pixels",
+                                             qwen35_image_resize_config_.min_pixels));
+          qwen35_image_resize_config_.max_pixels = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "max_pixels",
+                                             qwen35_image_resize_config_.max_pixels));
+        }
+      }
+    }
   }
 
   //----------------------------
@@ -1814,6 +1845,7 @@ class ModelImpl : public ModelObj {
   int image_embed_size_ = -1;
   int seqlen_padding_factor_ = 1;
   std::string model_type_;
+  Qwen35ImageResizeConfig qwen35_image_resize_config_;
   //----------------------------
   // TVM related states
   //----------------------------

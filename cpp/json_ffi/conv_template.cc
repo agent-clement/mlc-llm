@@ -28,6 +28,16 @@ int RoundToMultipleNearestEven(int value, int factor) {
   return ((quotient % 2) == 0 ? quotient : quotient + 1) * factor;
 }
 
+std::string StringifyContentJSON(const tvm::ffi::json::Value& value) {
+  std::string str = tvm::ffi::json::Stringify(value);
+  size_t pos = 0;
+  while ((pos = str.find("\\/", pos)) != std::string::npos) {
+    str.replace(pos, 2, "/");
+    pos += 1;
+  }
+  return str;
+}
+
 }  // namespace
 
 /****************** Model vision config ******************/
@@ -564,12 +574,13 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
     conv.system_prefix_token_ids = std::move(system_prefix_token_ids);
   }
 
-  Result<bool> add_role_after_system_message_res =
-      json::LookupWithResultReturn<bool>(json_obj, "add_role_after_system_message");
+  Result<std::optional<bool>> add_role_after_system_message_res =
+      json::LookupOptionalWithResultReturn<bool>(json_obj, "add_role_after_system_message");
   if (add_role_after_system_message_res.IsErr()) {
     return TResult::Error(add_role_after_system_message_res.UnwrapErr());
   }
-  conv.add_role_after_system_message = add_role_after_system_message_res.Unwrap();
+  conv.add_role_after_system_message =
+      add_role_after_system_message_res.Unwrap().value_or(conv.add_role_after_system_message);
 
   Result<tvm::ffi::json::Object> roles_object_res =
       json::LookupWithResultReturn<tvm::ffi::json::Object>(json_obj, "roles");
@@ -632,7 +643,7 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
         std::unordered_map<std::string, std::string> item_map;
         for (const auto& [key, value] : item.cast<tvm::ffi::json::Object>()) {
           item_map[key.cast<tvm::ffi::String>()] =
-              value.try_cast<std::string>().value_or(tvm::ffi::json::Stringify(value));
+              value.try_cast<std::string>().value_or(StringifyContentJSON(value));
         }
         content.push_back(std::move(item_map));
       }
@@ -674,30 +685,36 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
   }
   conv.role_empty_sep = role_empty_sep_res.Unwrap();
 
-  Result<tvm::ffi::json::Array> stop_str_arr_res =
-      json::LookupWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_str");
+  Result<std::optional<tvm::ffi::json::Array>> stop_str_arr_res =
+      json::LookupOptionalWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_str");
   if (stop_str_arr_res.IsErr()) {
     return TResult::Error(stop_str_arr_res.UnwrapErr());
   }
-  for (const auto& stop : stop_str_arr_res.Unwrap()) {
-    if (!stop.try_cast<std::string>().has_value()) {
-      return TResult::Error(
-          "A stop string (\"stop_str\") of the conversation template is not a string.");
+  std::optional<tvm::ffi::json::Array> stop_str_arr = stop_str_arr_res.Unwrap();
+  if (stop_str_arr.has_value()) {
+    for (const auto& stop : stop_str_arr.value()) {
+      if (!stop.try_cast<std::string>().has_value()) {
+        return TResult::Error(
+            "A stop string (\"stop_str\") of the conversation template is not a string.");
+      }
+      conv.stop_str.push_back(stop.cast<std::string>());
     }
-    conv.stop_str.push_back(stop.cast<std::string>());
   }
 
-  Result<tvm::ffi::json::Array> stop_token_ids_arr_res =
-      json::LookupWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_token_ids");
+  Result<std::optional<tvm::ffi::json::Array>> stop_token_ids_arr_res =
+      json::LookupOptionalWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_token_ids");
   if (stop_token_ids_arr_res.IsErr()) {
     return TResult::Error(stop_token_ids_arr_res.UnwrapErr());
   }
-  for (const auto& stop : stop_token_ids_arr_res.Unwrap()) {
-    if (!stop.try_cast<int64_t>().has_value()) {
-      return TResult::Error(
-          "A stop token id (\"stop_token_ids\") of the conversation template is not an integer.");
+  std::optional<tvm::ffi::json::Array> stop_token_ids_arr = stop_token_ids_arr_res.Unwrap();
+  if (stop_token_ids_arr.has_value()) {
+    for (const auto& stop : stop_token_ids_arr.value()) {
+      if (!stop.try_cast<int64_t>().has_value()) {
+        return TResult::Error(
+            "A stop token id (\"stop_token_ids\") of the conversation template is not an integer.");
+      }
+      conv.stop_token_ids.push_back(static_cast<int>(stop.cast<int64_t>()));
     }
-    conv.stop_token_ids.push_back(static_cast<int>(stop.cast<int64_t>()));
   }
 
   Result<std::optional<bool>> strip_reasoning_res =

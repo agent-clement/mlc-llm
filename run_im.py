@@ -18,7 +18,7 @@ DEFAULT_MODEL = (
 )
 DEFAULT_MODEL_LIB = (
     REPO_ROOT
-    / "dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicit-paged-stabledecodeinput-cuda.so"
+    / "dist/libs/logos-multitask-qwen3.5-2026-05-03-best-q0f16-ctx2048-pc320-explicitcrosscg-appendmetacg-relaxedmeta-outputcapture-noverify-pc320-cuda.so"
 )
 
 
@@ -562,7 +562,8 @@ def main() -> None:
                 "  MLC_MODEL=dist/logos-multitask-qwen3.5-2026-05-03-best-fusedinproj-"
                 f"q0f16-ctx2048-pc{required}-MLC "
                 "MLC_MODEL_LIB=dist/libs/logos-multitask-qwen3.5-2026-05-03-best-"
-                f"q0f16-ctx2048-pc{required}-explicit-paged-stabledecodeinput-cuda.so "
+                f"q0f16-ctx2048-pc{required}-explicitcrosscg-appendmetacg-relaxedmeta-"
+                f"outputcapture-noverify-pc{required}-cuda.so "
                 "./run_im.sh ..."
             )
         if args.raw_prompt:

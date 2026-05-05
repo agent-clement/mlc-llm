@@ -131,7 +131,7 @@ if(BUILD_CPP_TEST)
                              PRIVATE ${PROJECT_SOURCE_DIR}/cpp)
   target_include_directories(
     mlc_llm_cpp_tests PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
-  target_link_libraries(mlc_llm_cpp_tests PUBLIC mlc_llm gtest gtest_main)
+  target_link_libraries(mlc_llm_cpp_tests PUBLIC mlc_llm tokenizers_cpp gtest gtest_main)
 endif(BUILD_CPP_TEST)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Android")
