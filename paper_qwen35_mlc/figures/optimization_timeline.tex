@@ -1,0 +1,37 @@
+\begin{tikzpicture}
+\begin{axis}[
+    width=\linewidth,
+    height=0.50\linewidth,
+    ymin=395,
+    ymax=450,
+    ylabel={tokens/s},
+    symbolic x coords={packed GDN,stable input,cross graph,append+meta,relaxed meta},
+    xtick=data,
+    x tick label style={rotate=25, anchor=east, font=\scriptsize},
+    grid=major,
+    major grid style={draw=black!10},
+    legend style={at={(0.03,0.97)},anchor=north west,font=\scriptsize},
+]
+\addplot+[mark=*, thick, blue] coordinates {
+    (packed GDN,403.10)
+    (stable input,406.68)
+    (cross graph,411.02)
+    (append+meta,410.27)
+    (relaxed meta,414.23)
+};
+\addlegendentry{generated}
+\addplot+[mark=square*, thick, green!50!black] coordinates {
+    (packed GDN,433.26)
+    (stable input,437.17)
+    (cross graph,441.83)
+    (append+meta,441.48)
+    (relaxed meta,446.09)
+};
+\addlegendentry{effective decode}
+\addplot+[red, dashed, thick] coordinates {
+    (packed GDN,413.30)
+    (relaxed meta,413.30)
+};
+\addlegendentry{vLLM generated}
+\end{axis}
+\end{tikzpicture}

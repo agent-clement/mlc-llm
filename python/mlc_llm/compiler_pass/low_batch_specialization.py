@@ -1,9 +1,21 @@
 """A compiler pass that dispatch low-batch-gemm to gemv schedule."""
 
+import os
 import tvm
 from tvm import tirx
 from tvm.ir.module import IRModule
 from tvm.s_tir import dlight as dl
+
+
+def _parse_int_list_env(name: str, default: list[int]) -> list[int]:
+    value = os.environ.get(name)
+    if not value:
+        return default
+    try:
+        parsed = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError:
+        return default
+    return parsed or default
 
 
 @tvm.transform.module_pass(opt_level=0, name="LowBatchGemvSpecialize")
@@ -18,16 +30,23 @@ class LowBatchGemvSpecialize:
         """IRModule-level transformation"""
         for g_var, func in mod.functions_items():
             if isinstance(func, tirx.PrimFunc):
-                low_batch_range = [2, 8]
-                buckets = [2, 4]
+                if func.attrs and func.attrs.get("tirx.is_scheduled", 0):
+                    continue
+                low_batch_range = _parse_int_list_env("MLC_LOW_BATCH_GEMV_RANGES", [2, 8])
+                buckets = _parse_int_list_env("MLC_LOW_BATCH_GEMV_BUCKETS", [2, 4])
+                if len(low_batch_range) != len(buckets):
+                    continue
                 low_batch_funcs = []
-                for bucket in buckets:
-                    low_batch_mod = IRModule({})
-                    low_batch_mod["main"] = func
-                    low_batch_mod = dl.ApplyDefaultSchedule(
-                        dl.gpu.LowBatchGEMV(bucket),
-                    )(low_batch_mod)
-                    low_batch_funcs.append(low_batch_mod["main"])
+                try:
+                    for bucket in buckets:
+                        low_batch_mod = IRModule({})
+                        low_batch_mod["main"] = func
+                        low_batch_mod = dl.ApplyDefaultSchedule(
+                            dl.gpu.LowBatchGEMV(bucket),
+                        )(low_batch_mod)
+                        low_batch_funcs.append(low_batch_mod["main"])
+                except AssertionError:
+                    continue
                 if any(
                     tvm.ir.structural_equal(low_batch_func, func)
                     for low_batch_func in low_batch_funcs

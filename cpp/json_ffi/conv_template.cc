@@ -2,6 +2,9 @@
 
 #include <tvm/ffi/function.h>
 
+#include <algorithm>
+#include <cmath>
+
 #include "../support/json_parser.h"
 #include "image_utils.h"
 
@@ -10,6 +13,32 @@ namespace llm {
 namespace json_ffi {
 
 using namespace mlc::llm;
+
+namespace {
+
+int RoundToMultipleNearestEven(int value, int factor) {
+  int quotient = value / factor;
+  int remainder = value % factor;
+  if (2 * remainder < factor) {
+    return quotient * factor;
+  }
+  if (2 * remainder > factor) {
+    return (quotient + 1) * factor;
+  }
+  return ((quotient % 2) == 0 ? quotient : quotient + 1) * factor;
+}
+
+std::string StringifyContentJSON(const tvm::ffi::json::Value& value) {
+  std::string str = tvm::ffi::json::Stringify(value);
+  size_t pos = 0;
+  while ((pos = str.find("\\/", pos)) != std::string::npos) {
+    str.replace(pos, 2, "/");
+    pos += 1;
+  }
+  return str;
+}
+
+}  // namespace
 
 /****************** Model vision config ******************/
 
@@ -47,6 +76,28 @@ ModelVisionConfig ModelVisionConfig::FromJSON(const tvm::ffi::json::Object& json
   Result<int64_t> patch_size_res = json::LookupWithResultReturn<int64_t>(json_obj, "patch_size");
   if (patch_size_res.IsOk()) {
     config.patch_size = static_cast<int>(patch_size_res.Unwrap());
+  }
+
+  Result<int64_t> spatial_merge_size_res =
+      json::LookupWithResultReturn<int64_t>(json_obj, "spatial_merge_size");
+  if (spatial_merge_size_res.IsOk()) {
+    config.spatial_merge_size = static_cast<int>(spatial_merge_size_res.Unwrap());
+  } else {
+    config.spatial_merge_size = 2;
+  }
+
+  Result<int64_t> min_pixels_res = json::LookupWithResultReturn<int64_t>(json_obj, "min_pixels");
+  if (min_pixels_res.IsOk()) {
+    config.min_pixels = static_cast<int>(min_pixels_res.Unwrap());
+  } else {
+    config.min_pixels = 65536;
+  }
+
+  Result<int64_t> max_pixels_res = json::LookupWithResultReturn<int64_t>(json_obj, "max_pixels");
+  if (max_pixels_res.IsOk()) {
+    config.max_pixels = static_cast<int>(max_pixels_res.Unwrap());
+  } else {
+    config.max_pixels = 16777216;
   }
 
   Result<int64_t> projection_dim_res =
@@ -124,6 +175,12 @@ ModelConfig ModelConfig::FromJSON(const tvm::ffi::json::Object& json_obj) {
       json::LookupWithResultReturn<int64_t>(json_obj, "max_batch_size");
   if (max_batch_size_res.IsOk()) {
     config.max_batch_size = static_cast<int>(max_batch_size_res.Unwrap());
+  }
+
+  Result<std::string> model_type_res =
+      json::LookupWithResultReturn<std::string>(json_obj, "model_type");
+  if (model_type_res.IsOk()) {
+    config.model_type = model_type_res.Unwrap();
   }
 
   if (json_obj.count("vision_config")) {
@@ -309,10 +366,20 @@ Result<std::vector<Data>> CreatePrompt(const Conversation& conv,
             if (item.find("image_url") == item.end()) {
               return TResult::Error("Content should have an image_url field");
             }
-            std::string image_url =
-                item.at("image_url");  // TODO(mlc-team): According to OpenAI API reference this
-                                       // should be a map, with a "url" key containing the URL, but
-                                       // we are just assuming this as the URL for now
+            std::string image_url = item.at("image_url");
+            if (!image_url.empty() && image_url.front() == '{') {
+              Result<tvm::ffi::json::Object> image_url_obj_res =
+                  json::ParseToJSONObjectWithResultReturn(image_url);
+              if (image_url_obj_res.IsErr()) {
+                return TResult::Error(image_url_obj_res.UnwrapErr());
+              }
+              Result<std::string> url_res = json::LookupWithResultReturn<std::string>(
+                  image_url_obj_res.Unwrap(), "url");
+              if (url_res.IsErr()) {
+                return TResult::Error("Content image_url object should have a string url field");
+              }
+              image_url = url_res.Unwrap();
+            }
             std::string base64_image = image_url.substr(image_url.find(",") + 1);
             Result<Tensor> image_data_res = LoadImageFromBase64(base64_image);
             if (image_data_res.IsErr()) {
@@ -321,13 +388,49 @@ Result<std::vector<Data>> CreatePrompt(const Conversation& conv,
             if (!config.vision_config.has_value()) {
               return TResult::Error("Vision config is required for image input");
             }
-            int image_size = config.vision_config.value().image_size;
-            int patch_size = config.vision_config.value().patch_size;
-
-            int embed_size = (image_size * image_size) / (patch_size * patch_size);
-
             Tensor image_data = image_data_res.Unwrap();
-            std::vector<int64_t> new_shape = {1, image_size, image_size, 3};
+            int height = image_data->shape[0];
+            int width = image_data->shape[1];
+            int patch_size = config.vision_config.value().patch_size;
+            int spatial_merge_size = config.vision_config.value().spatial_merge_size;
+            int embed_size = 0;
+            int grid_t = 0;
+            int grid_h = 0;
+            int grid_w = 0;
+            if (config.model_type == "qwen3_5") {
+              if (height <= 0 || width <= 0) {
+                return TResult::Error("Invalid image shape for Qwen3.5 image input");
+              }
+              if (static_cast<double>(std::max(height, width)) / std::min(height, width) > 200.0) {
+                return TResult::Error("Image aspect ratio is too large for Qwen3.5 image input");
+              }
+              int factor = patch_size * spatial_merge_size;
+              int min_pixels = config.vision_config.value().min_pixels;
+              int max_pixels = config.vision_config.value().max_pixels;
+              int resized_height = std::max(factor, RoundToMultipleNearestEven(height, factor));
+              int resized_width = std::max(factor, RoundToMultipleNearestEven(width, factor));
+              if (static_cast<double>(resized_height) * resized_width > max_pixels) {
+                double beta = std::sqrt(static_cast<double>(height) * width / max_pixels);
+                resized_height = static_cast<int>(std::floor(height / beta / factor)) * factor;
+                resized_width = static_cast<int>(std::floor(width / beta / factor)) * factor;
+              } else if (static_cast<double>(resized_height) * resized_width < min_pixels) {
+                double beta =
+                    std::sqrt(static_cast<double>(min_pixels) / (static_cast<double>(height) * width));
+                resized_height = static_cast<int>(std::ceil(height * beta / factor)) * factor;
+                resized_width = static_cast<int>(std::ceil(width * beta / factor)) * factor;
+              }
+              grid_t = 1;
+              grid_h = resized_height / patch_size;
+              grid_w = resized_width / patch_size;
+              embed_size = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
+            } else {
+              int image_size = config.vision_config.value().image_size;
+              embed_size = (image_size * image_size) / (patch_size * patch_size);
+              height = image_size;
+              width = image_size;
+            }
+
+            std::vector<int64_t> new_shape = {1, height, width, 3};
             Tensor image_tensor = image_data.CreateView(new_shape, image_data.DataType());
             // TODO: Not sure if commenting will affect other functions. But
             // python part will do clip preprocessing. auto image_tensor =
@@ -337,7 +440,18 @@ Result<std::vector<Data>> CreatePrompt(const Conversation& conv,
               message_list.push_back(TextData(pending_text));
               pending_text = "";
             }
-            message_list.push_back(ImageData(image_tensor, embed_size));
+            if (config.model_type == "qwen3_5") {
+              message_list.push_back(TextData("<|vision_start|>"));
+            }
+            if (config.model_type == "qwen3_5") {
+              message_list.push_back(ImageData(image_tensor, embed_size, grid_t, grid_h, grid_w));
+            } else {
+              message_list.push_back(ImageData(image_tensor, embed_size));
+            }
+            if (config.model_type == "qwen3_5") {
+              message_list.push_back(TextData("<|vision_end|>"));
+              message_list.push_back(TextData("\n"));
+            }
           } else {
             return TResult::Error("Unsupported content type: " + it_type->second);
           }
@@ -460,12 +574,13 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
     conv.system_prefix_token_ids = std::move(system_prefix_token_ids);
   }
 
-  Result<bool> add_role_after_system_message_res =
-      json::LookupWithResultReturn<bool>(json_obj, "add_role_after_system_message");
+  Result<std::optional<bool>> add_role_after_system_message_res =
+      json::LookupOptionalWithResultReturn<bool>(json_obj, "add_role_after_system_message");
   if (add_role_after_system_message_res.IsErr()) {
     return TResult::Error(add_role_after_system_message_res.UnwrapErr());
   }
-  conv.add_role_after_system_message = add_role_after_system_message_res.Unwrap();
+  conv.add_role_after_system_message =
+      add_role_after_system_message_res.Unwrap().value_or(conv.add_role_after_system_message);
 
   Result<tvm::ffi::json::Object> roles_object_res =
       json::LookupWithResultReturn<tvm::ffi::json::Object>(json_obj, "roles");
@@ -527,7 +642,8 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
         }
         std::unordered_map<std::string, std::string> item_map;
         for (const auto& [key, value] : item.cast<tvm::ffi::json::Object>()) {
-          item_map[key.cast<tvm::ffi::String>()] = tvm::ffi::json::Stringify(value);
+          item_map[key.cast<tvm::ffi::String>()] =
+              value.try_cast<std::string>().value_or(StringifyContentJSON(value));
         }
         content.push_back(std::move(item_map));
       }
@@ -569,30 +685,36 @@ Result<Conversation> Conversation::FromJSON(const tvm::ffi::json::Object& json_o
   }
   conv.role_empty_sep = role_empty_sep_res.Unwrap();
 
-  Result<tvm::ffi::json::Array> stop_str_arr_res =
-      json::LookupWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_str");
+  Result<std::optional<tvm::ffi::json::Array>> stop_str_arr_res =
+      json::LookupOptionalWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_str");
   if (stop_str_arr_res.IsErr()) {
     return TResult::Error(stop_str_arr_res.UnwrapErr());
   }
-  for (const auto& stop : stop_str_arr_res.Unwrap()) {
-    if (!stop.try_cast<std::string>().has_value()) {
-      return TResult::Error(
-          "A stop string (\"stop_str\") of the conversation template is not a string.");
+  std::optional<tvm::ffi::json::Array> stop_str_arr = stop_str_arr_res.Unwrap();
+  if (stop_str_arr.has_value()) {
+    for (const auto& stop : stop_str_arr.value()) {
+      if (!stop.try_cast<std::string>().has_value()) {
+        return TResult::Error(
+            "A stop string (\"stop_str\") of the conversation template is not a string.");
+      }
+      conv.stop_str.push_back(stop.cast<std::string>());
     }
-    conv.stop_str.push_back(stop.cast<std::string>());
   }
 
-  Result<tvm::ffi::json::Array> stop_token_ids_arr_res =
-      json::LookupWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_token_ids");
+  Result<std::optional<tvm::ffi::json::Array>> stop_token_ids_arr_res =
+      json::LookupOptionalWithResultReturn<tvm::ffi::json::Array>(json_obj, "stop_token_ids");
   if (stop_token_ids_arr_res.IsErr()) {
     return TResult::Error(stop_token_ids_arr_res.UnwrapErr());
   }
-  for (const auto& stop : stop_token_ids_arr_res.Unwrap()) {
-    if (!stop.try_cast<int64_t>().has_value()) {
-      return TResult::Error(
-          "A stop token id (\"stop_token_ids\") of the conversation template is not an integer.");
+  std::optional<tvm::ffi::json::Array> stop_token_ids_arr = stop_token_ids_arr_res.Unwrap();
+  if (stop_token_ids_arr.has_value()) {
+    for (const auto& stop : stop_token_ids_arr.value()) {
+      if (!stop.try_cast<int64_t>().has_value()) {
+        return TResult::Error(
+            "A stop token id (\"stop_token_ids\") of the conversation template is not an integer.");
+      }
+      conv.stop_token_ids.push_back(static_cast<int>(stop.cast<int64_t>()));
     }
-    conv.stop_token_ids.push_back(static_cast<int>(stop.cast<int64_t>()));
   }
 
   Result<std::optional<bool>> strip_reasoning_res =

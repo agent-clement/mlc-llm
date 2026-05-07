@@ -1,0 +1,21 @@
+\begin{tikzpicture}
+\begin{axis}[
+    ybar stacked,
+    width=\linewidth,
+    height=0.36\linewidth,
+    ymin=0,
+    ymax=2500,
+    ylabel={MB},
+    symbolic x coords={single GPU},
+    xtick=data,
+    bar width=32pt,
+    legend style={at={(0.5,-0.25)},anchor=north,legend columns=3,font=\scriptsize},
+    grid=major,
+    major grid style={draw=black!10},
+]
+\addplot+[fill=blue!55, draw=blue!70] coordinates {(single GPU,1626.943)};
+\addplot+[fill=orange!70, draw=orange!80!black] coordinates {(single GPU,655.335)};
+\addplot+[fill=green!55!black, draw=green!50!black] coordinates {(single GPU,75.150)};
+\legend{parameters,temp buffer,KV cache}
+\end{axis}
+\end{tikzpicture}

@@ -26,6 +26,7 @@ def _numpy_apply_mrope(
     position_ids: np.ndarray,
     theta: float,
     mrope_section: tuple[int, ...],
+    interleaved: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     if position_ids.ndim != 3:
         raise ValueError(f"position_ids must be rank-3, got shape {position_ids.shape}")
@@ -45,15 +46,22 @@ def _numpy_apply_mrope(
     pos = pos.reshape(3, pos.shape[1], 1, pos.shape[2]).astype(np.float32)
     freqs = np.matmul(inv, pos)
     freqs = np.transpose(freqs, (0, 1, 3, 2))
+    if interleaved:
+        freqs_t = freqs[0].copy()
+        for axis, offset in enumerate((1, 2), start=1):
+            length = mrope_section[axis] * 3
+            freqs_t[..., offset:length:3] = freqs[axis, ..., offset:length:3]
+        freqs = freqs_t
     emb = np.concatenate([freqs, freqs], axis=-1)
     cos = np.cos(emb)
     sin = np.sin(emb)
-    split_sizes = list(mrope_section) * 2
-    split_points = np.cumsum(split_sizes)[:-1]
-    cos_chunks = np.split(cos, split_points, axis=-1)
-    sin_chunks = np.split(sin, split_points, axis=-1)
-    cos = np.concatenate([chunk[idx % 3] for idx, chunk in enumerate(cos_chunks)], axis=-1)
-    sin = np.concatenate([chunk[idx % 3] for idx, chunk in enumerate(sin_chunks)], axis=-1)
+    if not interleaved:
+        split_sizes = list(mrope_section) * 2
+        split_points = np.cumsum(split_sizes)[:-1]
+        cos_chunks = np.split(cos, split_points, axis=-1)
+        sin_chunks = np.split(sin, split_points, axis=-1)
+        cos = np.concatenate([chunk[idx % 3] for idx, chunk in enumerate(cos_chunks)], axis=-1)
+        sin = np.concatenate([chunk[idx % 3] for idx, chunk in enumerate(sin_chunks)], axis=-1)
     cos = np.expand_dims(cos, axis=2)
     sin = np.expand_dims(sin, axis=2)
     q_out = q * cos + _numpy_rotate_half(q) * sin
@@ -75,11 +83,14 @@ def _run_mlc_mrope(
     position_ids_np: np.ndarray,
     theta: float,
     mrope_section: tuple[int, ...],
+    interleaved: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     class RopeModule(nn.Module):
         def __init__(self):
             super().__init__()
-            self.rotary = MultimodalRotaryEmbedding(q_np.shape[-1], theta, mrope_section)
+            self.rotary = MultimodalRotaryEmbedding(
+                q_np.shape[-1], theta, mrope_section, interleaved=interleaved
+            )
 
         def forward(
             self,
@@ -89,7 +100,9 @@ def _run_mlc_mrope(
         ):
             """Run MRoPE on test tensors and return rotated query/key outputs."""
             cos, sin = self.rotary(q, pos)
-            return apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section)
+            return apply_multimodal_rotary_pos_emb(
+                q, k, cos, sin, mrope_section, interleaved=interleaved
+            )
 
     module = RopeModule()
     mod, _, _ = module.export_tvm(
@@ -127,6 +140,29 @@ def test_apply_mrope_matches_numpy_reference():
 
     mlc_q, mlc_k = _run_mlc_mrope(q_np, k_np, position_ids, theta, mrope_section)
     ref_q, ref_k = _numpy_apply_mrope(q_np, k_np, position_ids, theta, mrope_section)
+
+    np.testing.assert_allclose(mlc_q, ref_q, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(mlc_k, ref_k, rtol=1e-5, atol=1e-5)
+
+
+def test_apply_interleaved_mrope_matches_qwen35_numpy_reference():
+    theta = 10000000.0
+    mrope_section = (11, 11, 10)
+    batch, seq_len, heads, head_dim = 1, 6, 2, 64
+    rng = np.random.default_rng(3)
+    q_np = rng.standard_normal((batch, seq_len, heads, head_dim), dtype=np.float32)
+    k_np = rng.standard_normal((batch, seq_len, heads, head_dim), dtype=np.float32)
+    position_ids = np.zeros((3, batch, seq_len), dtype=np.int64)
+    position_ids[0, 0, :] = np.arange(seq_len)
+    position_ids[1, 0, :] = np.arange(seq_len) * 2
+    position_ids[2, 0, :] = np.arange(seq_len) * 3
+
+    mlc_q, mlc_k = _run_mlc_mrope(
+        q_np, k_np, position_ids, theta, mrope_section, interleaved=True
+    )
+    ref_q, ref_k = _numpy_apply_mrope(
+        q_np, k_np, position_ids, theta, mrope_section, interleaved=True
+    )
 
     np.testing.assert_allclose(mlc_q, ref_q, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(mlc_k, ref_k, rtol=1e-5, atol=1e-5)

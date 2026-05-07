@@ -10,8 +10,16 @@
 #include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/nvtx.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "../support/json_parser.h"
 #include "../support/vlm_utils.h"
@@ -27,6 +35,22 @@ namespace serve {
 TVM_FFI_STATIC_INIT_BLOCK() { ModelObj::RegisterReflection(); }
 
 class ModelImpl;
+
+bool ForceBatchDecodeForSingleSeq() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MLC_FORCE_BATCH_DECODE_FOR_SINGLE_SEQ");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+bool UseDecodeMropeQueryPositions() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MLC_QWEN35_DECODE_MROPE_QUERY_POSITIONS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
 
 Model Model::Create(String reload_lib_path, String model_path,
                     const tvm::ffi::json::Object& model_config, DLDevice device,
@@ -123,17 +147,46 @@ class ModelImpl : public ModelObj {
     }
   }
 
+  ObjectRef TokenEmbed(Tensor token_ids, ObjectRef* dst, int offset) final {
+    NVTXScopedRange nvtx_scope("TokenEmbedDevice");
+    TVM_FFI_ICHECK(SupportsDeviceTokenEmbed());
+    TVM_FFI_ICHECK_EQ(offset, 0);
+    TVM_FFI_ICHECK_EQ(token_ids->ndim, 1);
+    TVM_FFI_ICHECK(token_ids.DataType() == DataType::Int(32));
+    TVM_FFI_ICHECK_EQ(token_ids->device.device_type, device_.device_type);
+    TVM_FFI_ICHECK_EQ(token_ids->device.device_id, device_.device_id);
+    ObjectRef embeddings = ft_.embed_func_(token_ids, params_).cast<ObjectRef>();
+    if (dst != nullptr) {
+      TVM_FFI_ICHECK(dst->defined());
+      ft_.nd_copy_embedding_to_offset_func_(embeddings, *dst, offset);
+      return *dst;
+    }
+    return embeddings;
+  }
+
+  bool SupportsDeviceTokenEmbed() final {
+    return !ft_.use_disco && seqlen_padding_factor_ <= 1;
+  }
+
   ObjectRef ImageEmbed(const Tensor& image, ObjectRef* dst, int offset) final {
     NVTXScopedRange nvtx_scope("ImageEmbed");
     TVM_FFI_ICHECK(ft_.image_embed_func_.defined())
         << "`image_embed` function is not found in the model. ";
 
     int tmp_h = 0, tmp_w = 0;
-    CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    if (this->model_type_ == "qwen3_5") {
+      CalculateQwen35ResizeShape(image, qwen35_image_resize_config_, &tmp_h, &tmp_w);
+    } else {
+      CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    }
     Shape resize_h = {tmp_h};
     Shape resize_w = {tmp_w};
 
-    CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    if (this->model_type_ == "qwen3_5") {
+      CalculateQwen35CropShape(image, qwen35_image_resize_config_, &tmp_h, &tmp_w);
+    } else {
+      CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    }
     Shape crop_h = {tmp_h};
     Shape crop_w = {tmp_w};
 
@@ -152,7 +205,11 @@ class ModelImpl : public ModelObj {
   }
 
   bool CanGetLogits() final {
-    return ft_.get_logits_func_.defined() && ft_.batch_get_logits_func_.defined();
+    return ft_.get_logits_func_.defined();
+  }
+
+  bool CanGetTokenIds() final {
+    return ft_.get_token_ids_func_.defined();
   }
 
   Tensor GetLogits(const ObjectRef& hidden_states) final {
@@ -167,6 +224,16 @@ class ModelImpl : public ModelObj {
     } else {
       hidden_states_dref_or_nd = hidden_states;
     }
+    if (!ft_.use_disco && !hidden_states_dref_or_nd->IsInstance<DRefObj>()) {
+      Tensor hidden_states_nd = Downcast<Tensor>(hidden_states_dref_or_nd);
+      if (hidden_states_nd->ndim == 2) {
+        TVM_FFI_ICHECK_NE(hidden_size_, -1);
+        TVM_FFI_ICHECK_EQ(hidden_states_nd->shape[1], hidden_size_);
+        hidden_states_dref_or_nd =
+            hidden_states_nd.CreateView({hidden_states_nd->shape[0], 1, hidden_size_},
+                                        hidden_states_nd->dtype);
+      }
+    }
     ObjectRef ret = ft_.get_logits_func_(hidden_states_dref_or_nd, params_).cast<ObjectRef>();
     if (trace_enabled_) {
       DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
@@ -177,8 +244,49 @@ class ModelImpl : public ModelObj {
     } else {
       logits = Downcast<Tensor>(ret);
     }
+    if (logits->ndim == 3) {
+      int64_t num_tokens = logits->shape[0] * logits->shape[1];
+      logits = logits.CreateView({num_tokens, logits->shape[2]}, logits->dtype);
+    }
     // logits: (b * s, v)
     return logits;
+  }
+
+  Tensor GetTokenIds(const ObjectRef& hidden_states) final {
+    NVTXScopedRange nvtx_scope("GetTokenIds");
+    TVM_FFI_ICHECK(ft_.get_token_ids_func_.defined())
+        << "`get_token_ids` function is not found in the model.";
+
+    ObjectRef hidden_states_dref_or_nd{nullptr};
+    if (!ft_.use_disco && hidden_states->IsInstance<DRefObj>()) {
+      hidden_states_dref_or_nd =
+          Downcast<DRef>(hidden_states)->DebugGetFromRemote(0).cast<ObjectRef>();
+    } else {
+      hidden_states_dref_or_nd = hidden_states;
+    }
+    if (!ft_.use_disco && !hidden_states_dref_or_nd->IsInstance<DRefObj>()) {
+      Tensor hidden_states_nd = Downcast<Tensor>(hidden_states_dref_or_nd);
+      if (hidden_states_nd->ndim == 2) {
+        TVM_FFI_ICHECK_NE(hidden_size_, -1);
+        TVM_FFI_ICHECK_EQ(hidden_states_nd->shape[1], hidden_size_);
+        hidden_states_dref_or_nd =
+            hidden_states_nd.CreateView({hidden_states_nd->shape[0], 1, hidden_size_},
+                                        hidden_states_nd->dtype);
+      }
+    }
+    ObjectRef ret = ft_.get_token_ids_func_(hidden_states_dref_or_nd, params_).cast<ObjectRef>();
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+    Tensor token_ids{nullptr};
+    if (ft_.use_disco) {
+      token_ids = Downcast<DRef>(ret)->DebugGetFromRemote(0).cast<Tensor>();
+    } else {
+      token_ids = Downcast<Tensor>(ret);
+    }
+    TVM_FFI_ICHECK_EQ(token_ids->ndim, 1);
+    TVM_FFI_ICHECK(token_ids.DataType() == DataType::Int(32));
+    return token_ids;
   }
 
   Array<Tensor> GetMultiStepLogits(const ObjectRef& hidden_states) final {
@@ -361,6 +469,133 @@ class ModelImpl : public ModelObj {
     return logits;
   }
 
+  Tensor BatchPrefillWithMrope(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
+                               const std::vector<int>& lengths,
+                               const std::vector<Array<Data>>& input_data) final {
+    if (model_type_ != "qwen3_5") {
+      return BatchPrefill(embeddings, seq_ids, lengths);
+    }
+    bool contains_image = ContainsImageGrid(input_data);
+    if (!contains_image && !HasMropeDelta(seq_ids)) {
+      Tensor logits = BatchPrefill(embeddings, seq_ids, lengths);
+      AdvanceMropePrefilledLengths(seq_ids, lengths);
+      return logits;
+    }
+    TVM_FFI_ICHECK(ft_.prefill_mrope_func_.defined())
+        << "`batch_prefill_mrope` function is not found in the model.";
+    TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
+    TVM_FFI_ICHECK_EQ(seq_ids.size(), input_data.size());
+
+    int num_sequences = seq_ids.size();
+    int total_length = 0;
+    int* p_logit_pos = static_cast<int*>(logit_pos_arr_->data);
+    for (int i = 0; i < num_sequences; ++i) {
+      total_length += lengths[i];
+      p_logit_pos[i] = total_length - 1;
+    }
+    bool padded = total_length % seqlen_padding_factor_ != 0;
+    if (padded) {
+      total_length = (total_length + seqlen_padding_factor_ - 1) / seqlen_padding_factor_ *
+                     seqlen_padding_factor_;
+    }
+
+    NVTXScopedRange nvtx_scope("BatchPrefillWithMrope num_seq=" + std::to_string(num_sequences) +
+                               " total_len=" + std::to_string(total_length));
+    Tensor logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
+    Tensor position_ids_nd;
+    Tensor mrope_deltas_nd;
+    if (contains_image) {
+      std::tie(position_ids_nd, mrope_deltas_nd) =
+          BuildQwen35MropeTensors(seq_ids, input_data, lengths, total_length);
+    } else {
+      std::tie(position_ids_nd, mrope_deltas_nd) =
+          BuildQwen35ContinuationMropeTensors(seq_ids, lengths, total_length);
+    }
+
+    TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
+    TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
+    TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    IntTuple seq_ids_tuple(seq_ids);
+    IntTuple lengths_tuple(lengths.begin(), lengths.end());
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
+    if (kind == KVStateKind::kHybrid) {
+      TVM_FFI_ICHECK(rnn_state_.defined()) << "RNN state has not been initialized.";
+      ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple);
+    }
+
+    ObjectRef embeddings_dref_or_nd;
+    if (!embeddings->IsInstance<DRefObj>()) {
+      Tensor embeddings_nd = Downcast<Tensor>(embeddings);
+      TVM_FFI_ICHECK_NE(hidden_size_, -1);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->ndim, 2);
+      TVM_FFI_ICHECK_GE(embeddings_nd->shape[0], total_length);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->shape[1], hidden_size_);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->device.device_type, device_.device_type);
+      TVM_FFI_ICHECK_EQ(embeddings_nd->device.device_id, device_.device_id);
+      embeddings_dref_or_nd =
+          embeddings_nd.CreateView({1, total_length, hidden_size_}, embeddings_nd->dtype);
+    } else {
+      Shape embedding_shape{1, total_length, hidden_size_};
+      embeddings_dref_or_nd = ft_.nd_view_func_(embeddings, embedding_shape).cast<ObjectRef>();
+    }
+
+    TVM_FFI_ICHECK_NE(max_num_sequence_, -1);
+    ObjectRef logit_pos_dref_or_nd =
+        ft_.CopyToWorker0(logit_pos_nd, "logit_pos", {max_num_sequence_});
+    ObjectRef position_ids_dref_or_nd =
+        ft_.CopyToWorker0(position_ids_nd, "mrope_position_ids", position_ids_nd.Shape());
+    ObjectRef mrope_deltas_dref_or_nd =
+        ft_.CopyToWorker0(mrope_deltas_nd, "mrope_deltas", {max_num_sequence_, 1});
+
+    for (int64_t seq_id : seq_ids) {
+      prefilled_seq_ids_.insert(seq_id);
+    }
+
+    ObjectRef ret;
+    if (kind == KVStateKind::kHybrid) {
+      ret = ft_.prefill_mrope_func_(embeddings_dref_or_nd, position_ids_dref_or_nd,
+                                    mrope_deltas_dref_or_nd, logit_pos_dref_or_nd, kv_cache_,
+                                    rnn_state_, params_)
+                .cast<ObjectRef>();
+    } else {
+      ret = ft_.prefill_mrope_func_(embeddings_dref_or_nd, position_ids_dref_or_nd,
+                                    mrope_deltas_dref_or_nd, logit_pos_dref_or_nd, kv_cache_,
+                                    params_)
+                .cast<ObjectRef>();
+    }
+
+    Tensor logits;
+    if (ft_.use_disco) {
+      ret = ft_.tuple_getitem_func_(ret, 0).cast<ObjectRef>();
+      if (num_stages_ > 1) {
+        Shape shape{1, num_sequences, vocab_size_};
+        DataType dtype = DataType::Float(32);
+        ret = ft_.last_group_send_to_worker_0_(ret, disco_logits_arr_, shape, dtype)
+                  .cast<ObjectRef>();
+      }
+      logits = Downcast<DRef>(ret)->DebugGetFromRemote(0).cast<Tensor>();
+    } else {
+      logits = Downcast<Array<Tensor>>(ret)[0];
+    }
+    if (trace_enabled_) {
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    }
+    ft_.kv_cache_end_forward_func_(kv_cache_);
+    if (kind == KVStateKind::kHybrid) {
+      ft_.kv_cache_end_forward_func_(rnn_state_);
+    }
+    if (contains_image) {
+      StoreMropeDeltas(seq_ids, mrope_deltas_nd);
+    }
+    AdvanceMropePrefilledLengths(seq_ids, lengths);
+
+    TVM_FFI_ICHECK_EQ(logits->ndim, 3);
+    TVM_FFI_ICHECK_EQ(logits->shape[0], 1);
+    TVM_FFI_ICHECK_EQ(logits->shape[1], num_sequences);
+    return logits;
+  }
+
   ObjectRef BatchPrefillToLastHidden(const ObjectRef& embedding_or_hidden_states,
                                      const std::vector<int64_t>& seq_ids,
                                      const std::vector<int>& lengths) final {
@@ -486,11 +721,42 @@ class ModelImpl : public ModelObj {
 
     // args: embeddings, kv_cache, [rnn_state,] params
     ObjectRef ret;
-    if (kind == KVStateKind::kHybrid) {
-      // Hybrid always uses batch_decode (single_batch decode has tensor-based GDN args).
-      ret =
-          ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_).cast<ObjectRef>();
-    } else if (seq_ids.size() == 1) {
+    if (HasMropeDelta(seq_ids)) {
+      TVM_FFI_ICHECK(kind == KVStateKind::kHybrid)
+          << "`batch_decode_mrope` is only wired for hybrid Qwen3.5 models.";
+      ObjectRef mrope_deltas_dref_or_nd =
+          GetMropeDeltasForSeqIdsOnDevice(seq_ids, "decode_mrope_deltas");
+      if (UseDecodeMropeQueryPositions() && seq_ids.size() == 1 &&
+          !ForceBatchDecodeForSingleSeq() &&
+          ft_.single_batch_decode_mrope_with_query_positions_func_.defined()) {
+        ObjectRef query_positions_dref_or_nd =
+            ft_.kv_cache_get_query_positions_func_(kv_cache_).cast<ObjectRef>();
+        ret = ft_.single_batch_decode_mrope_with_query_positions_func_(
+                     embeddings_dref_or_nd, mrope_deltas_dref_or_nd, query_positions_dref_or_nd,
+                     kv_cache_, rnn_state_, params_)
+                  .cast<ObjectRef>();
+      } else if (seq_ids.size() == 1 && !ForceBatchDecodeForSingleSeq() &&
+                 ft_.single_batch_decode_mrope_func_.defined()) {
+        ret = ft_.single_batch_decode_mrope_func_(embeddings_dref_or_nd, mrope_deltas_dref_or_nd,
+                                                  kv_cache_, rnn_state_, params_)
+                  .cast<ObjectRef>();
+      } else {
+        TVM_FFI_ICHECK(ft_.decode_mrope_func_.defined())
+            << "`batch_decode_mrope` function is not found in the model.";
+        ret = ft_.decode_mrope_func_(embeddings_dref_or_nd, mrope_deltas_dref_or_nd, kv_cache_,
+                                     rnn_state_, params_)
+                  .cast<ObjectRef>();
+      }
+    } else if (kind == KVStateKind::kHybrid) {
+      if (seq_ids.size() == 1 && !ForceBatchDecodeForSingleSeq() &&
+          ft_.single_batch_decode_func_.defined()) {
+        ret = ft_.single_batch_decode_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_)
+                  .cast<ObjectRef>();
+      } else {
+        ret = ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_)
+                  .cast<ObjectRef>();
+      }
+    } else if (seq_ids.size() == 1 && !ForceBatchDecodeForSingleSeq()) {
       ret = ft_.single_batch_decode_func_(embeddings_dref_or_nd, kv_cache_, params_)
                 .cast<ObjectRef>();
     } else {
@@ -553,6 +819,10 @@ class ModelImpl : public ModelObj {
     IntTuple token_tree_parent_ptr_tuple(token_tree_parent_ptr);
     ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
                                      token_tree_parent_ptr_tuple);
+    if (kind == KVStateKind::kHybrid) {
+      ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple,
+                                       token_tree_parent_ptr_tuple);
+    }
 
     ObjectRef embeddings_dref_or_nd;
     if (!embeddings->IsInstance<DRefObj>()) {
@@ -573,9 +843,33 @@ class ModelImpl : public ModelObj {
 
     // same as BatchDecode
     ObjectRef ret;
-    if (0 && seq_ids.size() == 1) {
+    if (HasMropeDelta(seq_ids)) {
+      TVM_FFI_ICHECK(kind == KVStateKind::kHybrid)
+          << "`batch_verify_mrope` tree decode is only wired for hybrid Qwen3.5 models.";
+      TVM_FFI_ICHECK(ft_.verify_mrope_func_.defined())
+          << "`batch_verify_mrope` function is not found in the model.";
+      if (!embeddings_dref_or_nd->IsInstance<DRefObj>()) {
+        Tensor embeddings_nd = Downcast<Tensor>(embeddings_dref_or_nd);
+        embeddings_dref_or_nd =
+            embeddings_nd.CreateView({1, total_length, hidden_size_}, embeddings_nd->dtype);
+      } else {
+        Shape embedding_shape{1, total_length, hidden_size_};
+        embeddings_dref_or_nd = ft_.nd_view_func_(embeddings_dref_or_nd, embedding_shape)
+                                     .cast<ObjectRef>();
+      }
+      Tensor mrope_deltas = GetMropeDeltasForTokenSpans(seq_ids, lengths);
+      TVM_FFI_ICHECK_NE(prefill_chunk_size_, -1);
+      ObjectRef mrope_deltas_dref_or_nd =
+          ft_.CopyToWorker0(mrope_deltas, "tree_decode_mrope_deltas", {1, prefill_chunk_size_});
+      ret = ft_.verify_mrope_func_(embeddings_dref_or_nd, mrope_deltas_dref_or_nd, kv_cache_,
+                                   rnn_state_, params_)
+                .cast<ObjectRef>();
+    } else if (0 && seq_ids.size() == 1) {
       ret = ft_.single_batch_decode_func_(embeddings_dref_or_nd, kv_cache_, params_)
                 .cast<ObjectRef>();
+    } else if (kind == KVStateKind::kHybrid) {
+      ret =
+          ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_).cast<ObjectRef>();
     } else {
       ret = ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, params_).cast<ObjectRef>();
     }
@@ -590,12 +884,21 @@ class ModelImpl : public ModelObj {
       DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
     }
     ft_.kv_cache_end_forward_func_(kv_cache_);
+    if (kind == KVStateKind::kHybrid) {
+      ft_.kv_cache_end_forward_func_(rnn_state_);
+    }
 
     // logits: (b, 1, v)
     TVM_FFI_ICHECK_EQ(logits->ndim, 3);
-    TVM_FFI_ICHECK_EQ(logits->shape[0], total_length);
-    TVM_FFI_ICHECK_EQ(logits->shape[1], 1);
-    return logits;
+    if (HasMropeDelta(seq_ids)) {
+      TVM_FFI_ICHECK_EQ(logits->shape[0], 1);
+      TVM_FFI_ICHECK_EQ(logits->shape[1], total_length);
+      return logits.CreateView({total_length, 1, vocab_size_}, logits->dtype);
+    } else {
+      TVM_FFI_ICHECK_EQ(logits->shape[0], total_length);
+      TVM_FFI_ICHECK_EQ(logits->shape[1], 1);
+      return logits;
+    }
   }
 
   ObjectRef BatchDecodeToLastHidden(const ObjectRef& hidden_states_dref_or_nd,
@@ -603,9 +906,16 @@ class ModelImpl : public ModelObj {
     NVTXScopedRange nvtx_scope("BatchDecodeToLastHidden num_seqs=" +
                                std::to_string(seq_ids.size()));
     int num_sequence = seq_ids.size();
+    bool has_mrope_delta = HasMropeDelta(seq_ids);
 
-    TVM_FFI_ICHECK(ft_.decode_to_last_hidden_func_.defined())
-        << "`batch_decode_to_last_hidden_states` function is not found in the model.";
+    if (has_mrope_delta) {
+      TVM_FFI_ICHECK(kind == KVStateKind::kHybrid)
+          << "`batch_decode_mrope_to_last_hidden_states` is only wired for hybrid Qwen3.5 "
+             "models.";
+    } else {
+      TVM_FFI_ICHECK(ft_.decode_to_last_hidden_func_.defined())
+          << "`batch_decode_to_last_hidden_states` function is not found in the model.";
+    }
     TVM_FFI_ICHECK(ft_.kv_cache_begin_forward_func_.defined());
     TVM_FFI_ICHECK(ft_.kv_cache_end_forward_func_.defined());
     TVM_FFI_ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
@@ -619,27 +929,56 @@ class ModelImpl : public ModelObj {
       ft_.kv_cache_begin_forward_func_(rnn_state_, seq_ids_tuple, lengths_tuple);
     }
 
+    ObjectRef hidden_states_input;
+    if (!hidden_states_dref_or_nd->IsInstance<DRefObj>()) {
+      Tensor hidden_states_nd = Downcast<Tensor>(hidden_states_dref_or_nd);
+      TVM_FFI_ICHECK_NE(hidden_size_, -1);
+      TVM_FFI_ICHECK_EQ(hidden_states_nd->ndim, 2);
+      TVM_FFI_ICHECK_GE(hidden_states_nd->shape[0], num_sequence);
+      TVM_FFI_ICHECK_EQ(hidden_states_nd->shape[1], hidden_size_);
+      hidden_states_input =
+          hidden_states_nd.CreateView({num_sequence, 1, hidden_size_}, hidden_states_nd->dtype);
+    } else {
+      Shape hidden_shape{num_sequence, 1, hidden_size_};
+      hidden_states_input = ft_.nd_view_func_(hidden_states_dref_or_nd, hidden_shape)
+                                .cast<ObjectRef>();
+    }
+
     // args: embeddings, kv_cache, params
     ObjectRef result{nullptr};
-    if (seq_ids.size() == 1) {
+    if (has_mrope_delta) {
+      ObjectRef mrope_deltas_dref_or_nd =
+          GetMropeDeltasForSeqIdsOnDevice(seq_ids, "decode_mrope_hidden_deltas");
+      if (seq_ids.size() == 1 && !ForceBatchDecodeForSingleSeq() &&
+          ft_.single_batch_decode_mrope_to_last_hidden_func_.defined()) {
+        result = ft_.single_batch_decode_mrope_to_last_hidden_func_(
+                     hidden_states_input, mrope_deltas_dref_or_nd, kv_cache_, rnn_state_, params_)
+                     .cast<ObjectRef>();
+      } else {
+        TVM_FFI_ICHECK(ft_.decode_mrope_to_last_hidden_func_.defined())
+            << "`batch_decode_mrope_to_last_hidden_states` function is not found in the model.";
+        result = ft_.decode_mrope_to_last_hidden_func_(hidden_states_input, mrope_deltas_dref_or_nd,
+                                                       kv_cache_, rnn_state_, params_)
+                     .cast<ObjectRef>();
+      }
+    } else if (seq_ids.size() == 1 && !ForceBatchDecodeForSingleSeq()) {
       TVM_FFI_ICHECK(ft_.single_batch_decode_to_last_hidden_func_.defined())
           << "`decode_to_last_hidden_states` function is not found in the model.";
       if (kind == KVStateKind::kHybrid) {
-        result = ft_.single_batch_decode_to_last_hidden_func_(hidden_states_dref_or_nd, kv_cache_,
+        result = ft_.single_batch_decode_to_last_hidden_func_(hidden_states_input, kv_cache_,
                                                               rnn_state_, params_)
                      .cast<ObjectRef>();
       } else {
-        result = ft_.single_batch_decode_to_last_hidden_func_(hidden_states_dref_or_nd, kv_cache_,
+        result = ft_.single_batch_decode_to_last_hidden_func_(hidden_states_input, kv_cache_,
                                                               params_)
                      .cast<ObjectRef>();
       }
     } else {
       if (kind == KVStateKind::kHybrid) {
-        result = ft_.decode_to_last_hidden_func_(hidden_states_dref_or_nd, kv_cache_, rnn_state_,
-                                                 params_)
+        result = ft_.decode_to_last_hidden_func_(hidden_states_input, kv_cache_, rnn_state_, params_)
                      .cast<ObjectRef>();
       } else {
-        result = ft_.decode_to_last_hidden_func_(hidden_states_dref_or_nd, kv_cache_, params_)
+        result = ft_.decode_to_last_hidden_func_(hidden_states_input, kv_cache_, params_)
                      .cast<ObjectRef>();
       }
     }
@@ -717,7 +1056,19 @@ class ModelImpl : public ModelObj {
     }
     // args: embeddings, kv_cache, [rnn_state,] params
     ObjectRef ret;
-    if (kind == KVStateKind::kHybrid) {
+    if (HasMropeDelta(seq_ids)) {
+      TVM_FFI_ICHECK(kind == KVStateKind::kHybrid)
+          << "`batch_verify_mrope` is only wired for hybrid Qwen3.5 models.";
+      TVM_FFI_ICHECK(ft_.verify_mrope_func_.defined())
+          << "`batch_verify_mrope` function is not found in the model.";
+      Tensor mrope_deltas = GetMropeDeltasForTokenSpans(seq_ids, lengths);
+      TVM_FFI_ICHECK_NE(prefill_chunk_size_, -1);
+      ObjectRef mrope_deltas_dref_or_nd =
+          ft_.CopyToWorker0(mrope_deltas, "verify_mrope_deltas", {1, prefill_chunk_size_});
+      ret = ft_.verify_mrope_func_(embeddings_dref_or_nd, mrope_deltas_dref_or_nd, kv_cache_,
+                                   rnn_state_, params_)
+                .cast<ObjectRef>();
+    } else if (kind == KVStateKind::kHybrid) {
       ret =
           ft_.verify_func_(embeddings_dref_or_nd, kv_cache_, rnn_state_, params_).cast<ObjectRef>();
     } else {
@@ -758,6 +1109,9 @@ class ModelImpl : public ModelObj {
                                     const std::vector<int64_t>& token_tree_parent_ptr) final {
     TVM_FFI_ICHECK(!seq_ids.empty());
     TVM_FFI_ICHECK_EQ(seq_ids.size(), lengths.size());
+    TVM_FFI_ICHECK(!HasMropeDelta(seq_ids))
+        << "EAGLE/speculative verify-to-hidden is not supported after Qwen3.5 image input because "
+           "the exported model does not provide a multimodal MRoPE hidden-state verify function.";
     int num_sequences = seq_ids.size();
     int total_length = 0;
     for (int i = 0; i < num_sequences; ++i) {
@@ -909,6 +1263,20 @@ class ModelImpl : public ModelObj {
       ft_.kv_cache_fork_sequence_func_(rnn_state_, parent_seq_id, child_seq_id, fork_pos);
     }
     prefilled_seq_ids_.insert(child_seq_id);
+    if (auto it = mrope_delta_by_seq_id_.find(parent_seq_id);
+        it != mrope_delta_by_seq_id_.end()) {
+      mrope_delta_by_seq_id_[child_seq_id] = it->second;
+    }
+    if (auto it = mrope_delta_device_by_seq_id_.find(parent_seq_id);
+        it != mrope_delta_device_by_seq_id_.end()) {
+      mrope_delta_device_by_seq_id_[child_seq_id] = it->second;
+    }
+    if (auto it = mrope_prefilled_length_by_seq_id_.find(parent_seq_id);
+        it != mrope_prefilled_length_by_seq_id_.end()) {
+      int64_t mrope_fork_pos = fork_pos == -1 ? it->second : fork_pos;
+      mrope_prefilled_length_by_seq_id_[child_seq_id] =
+          static_cast<int>(std::min<int64_t>(it->second, mrope_fork_pos));
+    }
   }
 
   void RemoveSequence(int64_t seq_id) final {
@@ -916,6 +1284,9 @@ class ModelImpl : public ModelObj {
       return;
     }
     prefilled_seq_ids_.erase(seq_id);
+    mrope_delta_by_seq_id_.erase(seq_id);
+    mrope_delta_device_by_seq_id_.erase(seq_id);
+    mrope_prefilled_length_by_seq_id_.erase(seq_id);
     ft_.kv_cache_remove_sequence_func_(kv_cache_, seq_id);
     if (kind == KVStateKind::kHybrid) {
       ft_.kv_cache_remove_sequence_func_(rnn_state_, seq_id);
@@ -929,6 +1300,10 @@ class ModelImpl : public ModelObj {
     ft_.kv_cache_popn_func_(kv_cache_, seq_id, num_tokens);
     if (kind == KVStateKind::kHybrid) {
       ft_.kv_cache_popn_func_(rnn_state_, seq_id, num_tokens);
+    }
+    if (auto it = mrope_prefilled_length_by_seq_id_.find(seq_id);
+        it != mrope_prefilled_length_by_seq_id_.end()) {
+      it->second = std::max(0, it->second - num_tokens);
     }
   }
 
@@ -1113,6 +1488,10 @@ class ModelImpl : public ModelObj {
     if (rnn_state_.defined()) {
       ft_.reset_kv_cache_func_(rnn_state_);
     }
+    prefilled_seq_ids_.clear();
+    mrope_delta_by_seq_id_.clear();
+    mrope_delta_device_by_seq_id_.clear();
+    mrope_prefilled_length_by_seq_id_.clear();
   }
 
   /********************** Utilities for speculative decoding **********************/
@@ -1192,6 +1571,229 @@ class ModelImpl : public ModelObj {
   }
 
  private:
+  static bool ContainsImageGrid(const std::vector<Array<Data>>& input_data) {
+    for (const Array<Data>& sequence : input_data) {
+      for (const Data& data : sequence) {
+        if (const auto* image = data.as<ImageDataNode>()) {
+          if (image->grid_t > 0 && image->grid_h > 0 && image->grid_w > 0) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  static int InferSpatialMergeSize(const ImageDataNode* image) {
+    int full_grid = image->grid_t * image->grid_h * image->grid_w;
+    TVM_FFI_ICHECK_GT(image->embed_size, 0);
+    int merge_square = full_grid / image->embed_size;
+    int merge = static_cast<int>(std::round(std::sqrt(static_cast<double>(merge_square))));
+    TVM_FFI_ICHECK_GT(merge, 0);
+    TVM_FFI_ICHECK_EQ(merge * merge * image->embed_size, full_grid)
+        << "Invalid Qwen image grid metadata: grid=(" << image->grid_t << ", " << image->grid_h
+        << ", " << image->grid_w << "), embed_size=" << image->embed_size;
+    return merge;
+  }
+
+  std::pair<Tensor, Tensor> BuildQwen35MropeTensors(
+      const std::vector<int64_t>& seq_ids, const std::vector<Array<Data>>& input_data,
+      const std::vector<int>& lengths, int padded_total_length) const {
+    int num_sequences = input_data.size();
+    Tensor position_ids =
+        Tensor::Empty({3, 1, padded_total_length}, DataType::Int(32), Device{kDLCPU, 0});
+    Tensor mrope_deltas =
+        Tensor::Empty({num_sequences, 1}, DataType::Int(32), Device{kDLCPU, 0});
+    int* positions = static_cast<int*>(position_ids->data);
+    int* deltas = static_cast<int*>(mrope_deltas->data);
+    std::fill(positions, positions + 3 * padded_total_length, 0);
+    std::fill(deltas, deltas + num_sequences, 0);
+
+    int global_offset = 0;
+    for (int seq = 0; seq < num_sequences; ++seq) {
+      int local_offset = 0;
+      int delta = 0;
+      if (auto it = mrope_delta_by_seq_id_.find(seq_ids[seq]);
+          it != mrope_delta_by_seq_id_.end()) {
+        delta = it->second;
+      }
+      int consumed = 0;
+      if (auto it = mrope_prefilled_length_by_seq_id_.find(seq_ids[seq]);
+          it != mrope_prefilled_length_by_seq_id_.end()) {
+        consumed = it->second;
+      }
+      int current_pos = consumed + delta;
+      int max_position = current_pos - 1;
+      auto set_position = [&](int axis, int local_idx, int value) {
+        positions[axis * padded_total_length + global_offset + local_idx] = value;
+        max_position = std::max(max_position, value);
+      };
+
+      for (const Data& data : input_data[seq]) {
+        int length = data->GetLength();
+        if (const auto* image = data.as<ImageDataNode>();
+            image != nullptr && image->grid_t > 0 && image->grid_h > 0 && image->grid_w > 0) {
+          int merge = InferSpatialMergeSize(image);
+          TVM_FFI_ICHECK_EQ(image->grid_h % merge, 0);
+          TVM_FFI_ICHECK_EQ(image->grid_w % merge, 0);
+          int llm_grid_t = image->grid_t;
+          int llm_grid_h = image->grid_h / merge;
+          int llm_grid_w = image->grid_w / merge;
+          TVM_FFI_ICHECK_EQ(length, llm_grid_t * llm_grid_h * llm_grid_w);
+          int idx = 0;
+          for (int t = 0; t < llm_grid_t; ++t) {
+            for (int h = 0; h < llm_grid_h; ++h) {
+              for (int w = 0; w < llm_grid_w; ++w) {
+                set_position(0, local_offset + idx, current_pos + t);
+                set_position(1, local_offset + idx, current_pos + h);
+                set_position(2, local_offset + idx, current_pos + w);
+                ++idx;
+              }
+            }
+          }
+          current_pos += std::max(image->grid_h, image->grid_w) / merge;
+        } else {
+          for (int i = 0; i < length; ++i) {
+            set_position(0, local_offset + i, current_pos + i);
+            set_position(1, local_offset + i, current_pos + i);
+            set_position(2, local_offset + i, current_pos + i);
+          }
+          current_pos += length;
+        }
+        local_offset += length;
+      }
+      TVM_FFI_ICHECK_EQ(local_offset, lengths[seq]);
+      deltas[seq] = max_position + 1 - (consumed + lengths[seq]);
+      global_offset += lengths[seq];
+    }
+    return {position_ids, mrope_deltas};
+  }
+
+  std::pair<Tensor, Tensor> BuildQwen35ContinuationMropeTensors(
+      const std::vector<int64_t>& seq_ids, const std::vector<int>& lengths,
+      int padded_total_length) const {
+    int num_sequences = seq_ids.size();
+    Tensor position_ids =
+        Tensor::Empty({3, 1, padded_total_length}, DataType::Int(32), Device{kDLCPU, 0});
+    Tensor mrope_deltas =
+        Tensor::Empty({num_sequences, 1}, DataType::Int(32), Device{kDLCPU, 0});
+    int* positions = static_cast<int*>(position_ids->data);
+    int* deltas = static_cast<int*>(mrope_deltas->data);
+    std::fill(positions, positions + 3 * padded_total_length, 0);
+    std::fill(deltas, deltas + num_sequences, 0);
+
+    int global_offset = 0;
+    for (int seq = 0; seq < num_sequences; ++seq) {
+      int64_t seq_id = seq_ids[seq];
+      int delta = 0;
+      if (auto it = mrope_delta_by_seq_id_.find(seq_id); it != mrope_delta_by_seq_id_.end()) {
+        delta = it->second;
+      }
+      int consumed = 0;
+      if (auto it = mrope_prefilled_length_by_seq_id_.find(seq_id);
+          it != mrope_prefilled_length_by_seq_id_.end()) {
+        consumed = it->second;
+      }
+      deltas[seq] = delta;
+      for (int i = 0; i < lengths[seq]; ++i) {
+        int value = consumed + i + delta;
+        for (int axis = 0; axis < 3; ++axis) {
+          positions[axis * padded_total_length + global_offset + i] = value;
+        }
+      }
+      global_offset += lengths[seq];
+    }
+    return {position_ids, mrope_deltas};
+  }
+
+  void StoreMropeDeltas(const std::vector<int64_t>& seq_ids, const Tensor& mrope_deltas) {
+    int* deltas = static_cast<int*>(mrope_deltas->data);
+    for (int i = 0; i < static_cast<int>(seq_ids.size()); ++i) {
+      mrope_delta_by_seq_id_[seq_ids[i]] = deltas[i];
+      mrope_delta_device_by_seq_id_.erase(seq_ids[i]);
+      if (!mrope_prefilled_length_by_seq_id_.count(seq_ids[i])) {
+        mrope_prefilled_length_by_seq_id_[seq_ids[i]] = 0;
+      }
+    }
+  }
+
+  void AdvanceMropePrefilledLengths(const std::vector<int64_t>& seq_ids,
+                                    const std::vector<int>& lengths) {
+    for (int i = 0; i < static_cast<int>(seq_ids.size()); ++i) {
+      mrope_prefilled_length_by_seq_id_[seq_ids[i]] += lengths[i];
+    }
+  }
+
+  bool HasMropeDelta(const std::vector<int64_t>& seq_ids) const {
+    if (model_type_ != "qwen3_5") {
+      return false;
+    }
+    for (int64_t seq_id : seq_ids) {
+      if (mrope_delta_by_seq_id_.count(seq_id)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Tensor GetMropeDeltasForSeqIds(const std::vector<int64_t>& seq_ids) const {
+    Tensor mrope_deltas =
+        Tensor::Empty({static_cast<int64_t>(seq_ids.size()), 1}, DataType::Int(32),
+                      Device{kDLCPU, 0});
+    int* deltas = static_cast<int*>(mrope_deltas->data);
+    for (int i = 0; i < static_cast<int>(seq_ids.size()); ++i) {
+      auto it = mrope_delta_by_seq_id_.find(seq_ids[i]);
+      deltas[i] = it == mrope_delta_by_seq_id_.end() ? 0 : it->second;
+    }
+    return mrope_deltas;
+  }
+
+  ObjectRef GetMropeDeltasForSeqIdsOnDevice(const std::vector<int64_t>& seq_ids,
+                                            const char* buffer_cache_key) {
+    if (CacheDecodeMropeDeltasEnabled() && seq_ids.size() == 1) {
+      int64_t seq_id = seq_ids[0];
+      auto it = mrope_delta_device_by_seq_id_.find(seq_id);
+      if (it != mrope_delta_device_by_seq_id_.end()) {
+        return it->second;
+      }
+      Tensor mrope_deltas = GetMropeDeltasForSeqIds(seq_ids);
+      String cache_key("decode_mrope_deltas_seq_" + std::to_string(seq_id));
+      ObjectRef device_mrope_deltas =
+          ft_.CopyToWorker0(mrope_deltas, cache_key, {1, 1});
+      mrope_delta_device_by_seq_id_[seq_id] = device_mrope_deltas;
+      return device_mrope_deltas;
+    }
+    Tensor mrope_deltas = GetMropeDeltasForSeqIds(seq_ids);
+    return ft_.CopyToWorker0(mrope_deltas, buffer_cache_key, {max_num_sequence_, 1});
+  }
+
+  static bool CacheDecodeMropeDeltasEnabled() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("MLC_QWEN35_CACHE_DECODE_MROPE_DELTAS");
+      return value == nullptr || (value[0] != '\0' && value[0] != '0');
+    }();
+    return enabled;
+  }
+
+  Tensor GetMropeDeltasForTokenSpans(const std::vector<int64_t>& seq_ids,
+                                     const std::vector<int>& lengths) const {
+    int total_length = 0;
+    for (int length : lengths) {
+      total_length += length;
+    }
+    Tensor mrope_deltas =
+        Tensor::Empty({1, total_length}, DataType::Int(32), Device{kDLCPU, 0});
+    int* deltas = static_cast<int*>(mrope_deltas->data);
+    int offset = 0;
+    for (int i = 0; i < static_cast<int>(seq_ids.size()); ++i) {
+      auto it = mrope_delta_by_seq_id_.find(seq_ids[i]);
+      int delta = it == mrope_delta_by_seq_id_.end() ? 0 : it->second;
+      std::fill(deltas + offset, deltas + offset + lengths[i], delta);
+      offset += lengths[i];
+    }
+    return mrope_deltas;
+  }
+
   /*! \brief Load model configuration from JSON. */
   void LoadModelConfigJSON(const tvm::ffi::json::Object& config) {
     this->sliding_window_size_ =
@@ -1203,6 +1805,28 @@ class ModelImpl : public ModelObj {
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
     this->model_type_ = json::Lookup<std::string>(config, "model_type");
+    if (this->model_type_ == "qwen3_5") {
+      std::optional<tvm::ffi::json::Object> model_config =
+          json::LookupOptional<tvm::ffi::json::Object>(config, "model_config");
+      if (model_config.has_value()) {
+        std::optional<tvm::ffi::json::Object> vision_config =
+            json::LookupOptional<tvm::ffi::json::Object>(*model_config, "vision_config");
+        if (vision_config.has_value()) {
+          qwen35_image_resize_config_.patch_size = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "patch_size",
+                                             qwen35_image_resize_config_.patch_size));
+          qwen35_image_resize_config_.spatial_merge_size = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "spatial_merge_size",
+                                             qwen35_image_resize_config_.spatial_merge_size));
+          qwen35_image_resize_config_.min_pixels = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "min_pixels",
+                                             qwen35_image_resize_config_.min_pixels));
+          qwen35_image_resize_config_.max_pixels = static_cast<int>(
+              json::LookupOrDefault<int64_t>(*vision_config, "max_pixels",
+                                             qwen35_image_resize_config_.max_pixels));
+        }
+      }
+    }
   }
 
   //----------------------------
@@ -1221,6 +1845,7 @@ class ModelImpl : public ModelObj {
   int image_embed_size_ = -1;
   int seqlen_padding_factor_ = 1;
   std::string model_type_;
+  Qwen35ImageResizeConfig qwen35_image_resize_config_;
   //----------------------------
   // TVM related states
   //----------------------------
@@ -1251,6 +1876,12 @@ class ModelImpl : public ModelObj {
   KVStateKind kind;
   // A set of sequence IDs that have been prefilled.
   std::unordered_set<int64_t> prefilled_seq_ids_;
+  // Per-sequence MRoPE delta for Qwen multimodal decoding.
+  std::unordered_map<int64_t, int> mrope_delta_by_seq_id_;
+  // Cached single-sequence device MRoPE delta tensors for decode.
+  std::unordered_map<int64_t, ObjectRef> mrope_delta_device_by_seq_id_;
+  // Number of prompt tokens already prefilled for MRoPE continuation chunks.
+  std::unordered_map<int64_t, int> mrope_prefilled_length_by_seq_id_;
 };
 
 TVM_FFI_STATIC_INIT_BLOCK() {

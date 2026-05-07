@@ -13,6 +13,14 @@
 namespace mlc {
 namespace llm {
 
+/*! \brief Vision resize parameters for Qwen3.5 image embedding. */
+struct Qwen35ImageResizeConfig {
+  int patch_size = 16;
+  int spatial_merge_size = 2;
+  int min_pixels = 65536;
+  int max_pixels = 16777216;
+};
+
 /*!
  * \brief Calculate the target height and width for resizing an image based on the input data and
  * model type. \param image_data The input image data as a TVM Tensor. \param model_type The type
@@ -22,6 +30,13 @@ namespace llm {
  */
 void CalculateResizeShape(tvm::runtime::Tensor image_data, std::string model_type,
                           int* p_target_height, int* p_target_width);
+
+/*!
+ * \brief Calculate the Qwen3.5 target height and width from model vision config.
+ */
+void CalculateQwen35ResizeShape(tvm::runtime::Tensor image_data,
+                                const Qwen35ImageResizeConfig& config, int* p_target_height,
+                                int* p_target_width);
 /*!
  * \brief Calculate the padding height and width for an image based on the input data and model
  * type. \param image_data The input image data as a TVM Tensor. \param model_type The type of the
@@ -41,6 +56,13 @@ void CalculatePadShape(tvm::runtime::Tensor image_data, std::string model_type, 
  */
 void CalculateCropShape(tvm::runtime::Tensor image_data, std::string model_type, int* p_crop_height,
                         int* p_crop_width);
+
+/*!
+ * \brief Calculate the Qwen3.5 crop height and width from model vision config.
+ */
+void CalculateQwen35CropShape(tvm::runtime::Tensor image_data,
+                              const Qwen35ImageResizeConfig& config, int* p_crop_height,
+                              int* p_crop_width);
 
 }  // namespace llm
 }  // namespace mlc

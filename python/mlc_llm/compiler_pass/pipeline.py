@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: UP035
 
 import tvm
-from tvm import IRModule
+from tvm import IRModule, tirx
 from tvm.relax import register_pipeline
 from tvm.relax.frontend import nn
 from tvm.s_tir import dlight as dl
@@ -75,6 +75,32 @@ class _DebugDump:
             logger.debug("Dumping IR to %s", self.file_path / self.file_name)
             with open(self.file_path / self.file_name, "w", encoding="utf-8") as f:
                 f.write(mod.script(show_meta=self.show_meta))
+        return mod
+
+
+@tvm.transform.module_pass(opt_level=0, name="ApplyDefaultScheduleWithFallback")
+class _ApplyDefaultScheduleWithFallback:
+    """Apply DLight schedules per PrimFunc, falling back on non-matching assertions."""
+
+    def __init__(self, *rules):
+        self.rules = rules
+
+    def transform_module(self, mod: IRModule, _ctx: tvm.transform.PassContext) -> IRModule:
+        """Schedule each PrimFunc independently."""
+        schedule = dl.ApplyDefaultSchedule(*self.rules)
+        fallback = dl.ApplyDefaultSchedule(dl.gpu.Fallback())
+        for g_var, func in mod.functions_items():
+            if not isinstance(func, tirx.PrimFunc):
+                continue
+            if func.attrs and func.attrs.get("tirx.is_scheduled", 0):
+                continue
+            one_func_mod = IRModule({})
+            one_func_mod["main"] = func
+            try:
+                one_func_mod = schedule(one_func_mod)
+            except AssertionError:
+                one_func_mod = fallback(one_func_mod)
+            mod.update_func(g_var, one_func_mod["main"])
         return mod
 
 
@@ -152,7 +178,7 @@ def _mlc_llm_pipeline(
                 _LogProgress("Running TVM Dlight low-level optimizations"),
                 LowBatchGemvSpecialize(),
                 (
-                    dl.ApplyDefaultSchedule(
+                    _ApplyDefaultScheduleWithFallback(
                         dl.gpu.Matmul(),
                         dl.gpu.GEMV(),
                         dl.gpu.Reduction(),
@@ -192,6 +218,7 @@ def _mlc_llm_pipeline(
                 _DebugDump("debug-phase5.py", debug_dump, show_meta=False),
                 tvm.relax.transform.RewriteCUDAGraph(),
                 AttachCUDAGraphAllocInitFunc(),
+                _DebugDump("debug-phase6.py", debug_dump, show_meta=False),
                 tvm.relax.transform.LowerGPUIPCAllocStorage(),
                 tvm.relax.transform.LowerAllocTensor(),
                 tvm.relax.transform.KillAfterLastUse(),

@@ -432,12 +432,16 @@ class EngineImpl : public Engine {
     EngineConfig engine_config = engine_config_res.Unwrap();
     {
       if (engine_config->prefix_cache_mode == PrefixCacheMode::kRadix) {
+        KVStateKind kv_state_kind = n->models_[0]->GetMetadata().kv_state_kind;
+        bool allow_non_tail_forks =
+            kv_state_kind != KVStateKind::kHybrid && kv_state_kind != KVStateKind::kRNNState;
         n->estate_->prefix_cache = PrefixCache::CreateRadixPrefixCache(
             static_cast<size_t>(engine_config->prefix_cache_max_num_recycling_seqs),
             [engine_ptr = n.get()](int64_t seq_id) {
               RemoveRequestFromModel(engine_ptr->estate_, seq_id, engine_ptr->models_);
               engine_ptr->estate_->id_manager.RecycleId(seq_id);
-            });
+            },
+            allow_non_tail_forks);
       } else if (engine_config->prefix_cache_mode == PrefixCacheMode::kDisable) {
         n->estate_->prefix_cache = PrefixCache::CreateNoPrefixCache();
       } else {
@@ -747,20 +751,39 @@ class EngineImpl : public Engine {
   void Step() final {
     TVM_FFI_ICHECK(estate_->request_stream_callback_ != nullptr)
         << "The request stream callback is not set. Engine cannot execute.";
-    for (EngineAction action : actions_) {
+    auto step_tstart = std::chrono::high_resolution_clock::now();
+    for (int action_index = 0; action_index < static_cast<int>(actions_.size()); ++action_index) {
+      EngineAction action = actions_[action_index];
       Array<Request> processed_requests;
       {
         NVTXScopedRange nvtx_scope("Action step");
+        auto action_tstart = std::chrono::high_resolution_clock::now();
         processed_requests = action->Step(estate_);
+        auto action_tend = std::chrono::high_resolution_clock::now();
+        double action_elapsed = static_cast<double>((action_tend - action_tstart).count()) / 1e9;
+        estate_->metrics.engine_action_step_time_sum += action_elapsed;
+        if (action_index >= static_cast<int>(estate_->metrics.engine_action_time_by_index.size())) {
+          estate_->metrics.engine_action_time_by_index.resize(action_index + 1, 0.0);
+        }
+        estate_->metrics.engine_action_time_by_index[action_index] += action_elapsed;
       }
       if (!processed_requests.empty()) {
+        auto postprocess_tstart = std::chrono::high_resolution_clock::now();
         ActionStepPostProcess(processed_requests, estate_, models_, tokenizer_,
                               estate_->request_stream_callback_,
                               engine_config_->max_single_sequence_length,
                               draft_token_workspace_manager_, trace_recorder_);
+        auto step_tend = std::chrono::high_resolution_clock::now();
+        estate_->metrics.engine_postprocess_time_sum +=
+            static_cast<double>((step_tend - postprocess_tstart).count()) / 1e9;
+        estate_->metrics.engine_step_time_sum +=
+            static_cast<double>((step_tend - step_tstart).count()) / 1e9;
         return;
       }
     }
+    auto step_tend = std::chrono::high_resolution_clock::now();
+    estate_->metrics.engine_step_time_sum +=
+        static_cast<double>((step_tend - step_tstart).count()) / 1e9;
     TVM_FFI_ICHECK(estate_->running_queue.empty())
         << "Internal assumption violated: It is expected that an engine step takes at least one "
            "action (e.g. prefill, decode, etc.) but it does not.";

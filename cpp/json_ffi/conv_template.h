@@ -32,6 +32,9 @@ class ModelVisionConfig {
   int num_attention_heads;
   int num_hidden_layers;
   int patch_size;
+  int spatial_merge_size;
+  int min_pixels;
+  int max_pixels;
   int projection_dim;
   int vocab_size;
   std::string dtype;
@@ -54,6 +57,7 @@ class ModelConfig {
   int tensor_parallel_shards;
   int pipeline_parallel_stages;
   int max_batch_size;
+  std::string model_type;
   std::optional<ModelVisionConfig> vision_config = std::nullopt;
 
   static ModelConfig FromJSON(const tvm::ffi::json::Object& json_obj);

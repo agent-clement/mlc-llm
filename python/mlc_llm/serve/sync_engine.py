@@ -9,6 +9,8 @@ the test and debug purpose because of its simplicity.
 """
 
 import json
+import os
+import time
 from collections.abc import Sequence
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union  # noqa: UP035
 
@@ -212,10 +214,15 @@ class SyncMLCEngine:
             "Number of generation config and number of prompts mismatch"
         )
 
+        timing_enabled = os.environ.get("MLC_SYNC_GENERATE_TIMING", "") not in ("", "0")
+        timing = {}
+        generate_tstart = time.perf_counter() if timing_enabled else 0.0
+
         num_finished_generations = 0
         output_texts: List[List[str]] = []  # noqa: UP006
         output_logprobs_str: List[Optional[List[List[str]]]] = []  # noqa: UP006
         text_streamers: List[List[TextStreamer]] = []  # noqa: UP006
+        setup_tstart = time.perf_counter() if timing_enabled else 0.0
         for i in range(num_requests):
             output_texts.append([])
             output_logprobs_str.append([] if generation_config[i].logprobs else None)
@@ -227,15 +234,22 @@ class SyncMLCEngine:
                     output_logprobs_str[i].append([])
 
         num_total_generations = sum(cfg.n for cfg in generation_config)
+        if timing_enabled:
+            timing["setup_seconds"] = time.perf_counter() - setup_tstart
 
         # Save a copy of the original function callback since `generate`
         # overrides the callback function.
         # The original callback will be set back later on.
+        get_callback_tstart = time.perf_counter() if timing_enabled else 0.0
         original_callback = self._ffi["get_request_stream_callback"]()
+        if timing_enabled:
+            timing["get_callback_seconds"] = time.perf_counter() - get_callback_tstart
 
         # Define the callback function for request generation results
         def request_stream_callback(delta_outputs: List[data.RequestStreamOutput]):  # noqa: UP006
             nonlocal num_finished_generations
+            callback_tstart = time.perf_counter() if timing_enabled else 0.0
+            detokenize_seconds = 0.0
             for delta_output in delta_outputs:
                 request_id, stream_outputs = delta_output.unpack()
                 rid = int(request_id)
@@ -248,6 +262,7 @@ class SyncMLCEngine:
                         assert stream_output.delta_logprob_json_strs is not None
                         output_logprobs_str[rid][i] += stream_output.delta_logprob_json_strs
 
+                    detokenize_tstart = time.perf_counter() if timing_enabled else 0.0
                     delta_text = stream_output.extra_prefix_string + (
                         text_streamer.put(stream_output.delta_token_ids)
                         if len(stream_output.delta_token_ids) > 0
@@ -255,13 +270,25 @@ class SyncMLCEngine:
                     )
                     if stream_output.finish_reason is not None:
                         delta_text += text_streamer.finish()
+                    if timing_enabled:
+                        detokenize_seconds += time.perf_counter() - detokenize_tstart
 
                     output_texts[rid][i] += delta_text
                     if stream_output.finish_reason is not None:
                         num_finished_generations += 1
+            if timing_enabled:
+                timing["callback_seconds"] = timing.get("callback_seconds", 0.0) + (
+                    time.perf_counter() - callback_tstart
+                )
+                timing["detokenize_seconds"] = (
+                    timing.get("detokenize_seconds", 0.0) + detokenize_seconds
+                )
 
         # Override the callback function in engine.
+        set_callback_tstart = time.perf_counter() if timing_enabled else 0.0
         self._ffi["set_request_stream_callback"](request_stream_callback)
+        if timing_enabled:
+            timing["set_callback_seconds"] = time.perf_counter() - set_callback_tstart
 
         def convert_to_data(
             prompt: Union[str, List[int], List[data.Data]],  # noqa: UP006
@@ -273,6 +300,7 @@ class SyncMLCEngine:
             return prompt
 
         # Add requests to engine.
+        add_request_tstart = time.perf_counter() if timing_enabled else 0.0
         for req_id, (prompt, generation_cfg) in enumerate(zip(prompts, generation_config)):
             input_data = convert_to_data(prompt)
             self.add_request(
@@ -282,12 +310,25 @@ class SyncMLCEngine:
                     generation_config=generation_cfg,
                 )
             )
+        if timing_enabled:
+            timing["add_request_seconds"] = time.perf_counter() - add_request_tstart
 
+        step_loop_tstart = time.perf_counter() if timing_enabled else 0.0
+        step_count = 0
         while num_finished_generations != num_total_generations:
             self.step()
+            step_count += 1
+        if timing_enabled:
+            timing["step_loop_seconds"] = time.perf_counter() - step_loop_tstart
+            timing["step_count"] = step_count
 
         # Restore the callback function in engine.
+        restore_callback_tstart = time.perf_counter() if timing_enabled else 0.0
         self._ffi["set_request_stream_callback"](original_callback)
+        if timing_enabled:
+            timing["restore_callback_seconds"] = time.perf_counter() - restore_callback_tstart
+            timing["total_generate_seconds"] = time.perf_counter() - generate_tstart
+            self.last_generate_timing = timing
         return output_texts, output_logprobs_str
 
     def create_request(

@@ -139,6 +139,95 @@ class RNNState(Object):
             _name="rnn_state_set",
         )
 
+    def get_storage(
+        self,
+        layer_id: int,
+        state_id: int,
+        shape: Sequence[tirx.PrimExpr],
+        dtype: str,
+        max_batch_size: tirx.PrimExpr = None,
+        max_history: tirx.PrimExpr = None,
+    ) -> Tensor:
+        """Get the raw backing storage tensor for a state.
+
+        The returned tensor has shape `(max_batch_size, max_history, *shape)`.
+        This is a low-level hook for compiler-generated kernels that can safely
+        index by the current sequence/history slot tensors and avoid separate
+        state get/set copy kernels.
+        """
+        bb = rx.BlockBuilder.current()
+        if max_batch_size is None:
+            raise ValueError("max_batch_size must be provided for RNNState.get_storage")
+        if max_history is None:
+            raise ValueError("max_history must be provided for RNNState.get_storage")
+        sinfo = rx.TensorStructInfo((max_batch_size, max_history, *shape), dtype)
+        return Tensor(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_get_storage",
+                    self._expr,
+                    rx.PrimValue(layer_id),
+                    rx.PrimValue(state_id),
+                    sinfo_args=[sinfo],
+                )
+            )
+        )
+
+    def get_storages(
+        self,
+        num_layers: int,
+        state_id: int,
+        shape: Sequence[tirx.PrimExpr],
+        dtype: str,
+        max_batch_size: tirx.PrimExpr = None,
+        max_history: tirx.PrimExpr = None,
+    ) -> Sequence[Tensor]:
+        """Get raw backing storage tensors for the given state id across all layers."""
+        bb = rx.BlockBuilder.current()
+        if max_batch_size is None:
+            raise ValueError("max_batch_size must be provided for RNNState.get_storages")
+        if max_history is None:
+            raise ValueError("max_history must be provided for RNNState.get_storages")
+        sinfo = rx.TensorStructInfo((max_batch_size, max_history, *shape), dtype)
+        storages = bb.emit(
+            rx.call_pure_packed(
+                "vm.builtin.rnn_state_get_storages",
+                self._expr,
+                rx.PrimValue(state_id),
+                sinfo_args=[rx.TupleStructInfo([sinfo for _ in range(num_layers)])],
+            )
+        )
+        return [
+            Tensor(_expr=bb.emit(rx.TupleGetItem(storages, layer_id)))
+            for layer_id in range(num_layers)
+        ]
+
+    def get_seq_slot_ids(self, batch_size: tirx.PrimExpr) -> Tensor:
+        """Get current sequence slot ids on device for the active forward window."""
+        bb = rx.BlockBuilder.current()
+        return Tensor(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_get_seq_slot_ids",
+                    self._expr,
+                    sinfo_args=[rx.TensorStructInfo((batch_size,), "int32")],
+                )
+            )
+        )
+
+    def get_history_slot_ids(self, batch_size: tirx.PrimExpr) -> Tensor:
+        """Get current history slot ids on device for the active forward window."""
+        bb = rx.BlockBuilder.current()
+        return Tensor(
+            _expr=bb.emit(
+                rx.call_pure_packed(
+                    "vm.builtin.rnn_state_get_history_slot_ids",
+                    self._expr,
+                    sinfo_args=[rx.TensorStructInfo((batch_size,), "int32")],
+                )
+            )
+        )
+
     @staticmethod
     def create_get_func(
         shape: Sequence[Union[int, tirx.Var]],

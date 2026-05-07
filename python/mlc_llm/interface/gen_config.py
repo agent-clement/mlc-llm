@@ -44,6 +44,80 @@ def check_string(s: str) -> bool:
     return True
 
 
+def apply_qwen35_preprocessor_config(config_path: Path, model_config) -> None:
+    """Fold Qwen3.5 image processor limits into model_config.vision_config."""
+
+    if getattr(model_config, "model_type", None) != "qwen3_5":
+        return
+    vision_config = getattr(model_config, "vision_config", None)
+    if not isinstance(vision_config, dict):
+        return
+    preprocessor_config = config_path.parent / "preprocessor_config.json"
+    if not preprocessor_config.exists():
+        logger.info("%s Qwen3.5 preprocessor config: %s", NOT_FOUND, preprocessor_config)
+        return
+
+    with preprocessor_config.open("r", encoding="utf-8") as in_file:
+        preprocessor_json = json.load(in_file)
+
+    size = preprocessor_json.get("size", {})
+    if "shortest_edge" in size:
+        vision_config["min_pixels"] = int(size["shortest_edge"])
+    if "longest_edge" in size:
+        vision_config["max_pixels"] = int(size["longest_edge"])
+    if "patch_size" in preprocessor_json:
+        vision_config["patch_size"] = int(preprocessor_json["patch_size"])
+    if "temporal_patch_size" in preprocessor_json:
+        vision_config["temporal_patch_size"] = int(preprocessor_json["temporal_patch_size"])
+    if "merge_size" in preprocessor_json:
+        vision_config["spatial_merge_size"] = int(preprocessor_json["merge_size"])
+    logger.info("%s Qwen3.5 preprocessor config: %s", FOUND, preprocessor_config)
+
+
+def apply_qwen35_generation_defaults(config_path: Path, mlc_chat_config: MLCChatConfig) -> None:
+    """Recover Qwen3.5 special token ids when generation_config.json is absent."""
+
+    with config_path.open("r", encoding="utf-8") as in_file:
+        config_json = json.load(in_file)
+    if config_json.get("model_type") != "qwen3_5":
+        return
+
+    text_config = config_json.get("text_config", {})
+    for key in ["pad_token_id", "bos_token_id", "eos_token_id"]:
+        if getattr(mlc_chat_config, key) is not None:
+            continue
+        if key in config_json:
+            setattr(mlc_chat_config, key, config_json[key])
+            logger.info("[config.json] Setting %s: %s", bold(key), config_json[key])
+        elif key in text_config:
+            setattr(mlc_chat_config, key, text_config[key])
+            logger.info("[config.json:text_config] Setting %s: %s", bold(key), text_config[key])
+
+    tokenizer_config_path = config_path.parent / "tokenizer_config.json"
+    if not tokenizer_config_path.exists():
+        return
+    with tokenizer_config_path.open("r", encoding="utf-8") as in_file:
+        tokenizer_config = json.load(in_file)
+
+    token_to_id = {}
+    for token_id, token_info in tokenizer_config.get("added_tokens_decoder", {}).items():
+        content = token_info.get("content")
+        if content is not None:
+            token_to_id[content] = int(token_id)
+
+    for token_key, id_key in [
+        ("pad_token", "pad_token_id"),
+        ("bos_token", "bos_token_id"),
+        ("eos_token", "eos_token_id"),
+    ]:
+        if getattr(mlc_chat_config, id_key) is not None:
+            continue
+        token = tokenizer_config.get(token_key)
+        if isinstance(token, str) and token in token_to_id:
+            setattr(mlc_chat_config, id_key, token_to_id[token])
+            logger.info("[tokenizer_config.json] Setting %s: %s", bold(id_key), token_to_id[token])
+
+
 def txt2rwkv_tokenizer(vocab: Path, out: Path) -> None:
     """Generate tokenizer_model from RWKV vocab file."""
     idx2token = {}
@@ -124,6 +198,7 @@ def gen_config(
         pipeline_parallel_stages=pipeline_parallel_stages,
         disaggregation=disaggregation,
     ).apply(model.config.from_file(config))
+    apply_qwen35_preprocessor_config(config, model_config)
     mlc_chat_config = MLCChatConfig(
         model_type=model.name,
         quantization=quantization.name,
@@ -160,6 +235,7 @@ def gen_config(
                     )
         else:
             logger.info("%s %s: %s", NOT_FOUND, generation_config_filename, generation_config)
+    apply_qwen35_generation_defaults(config, mlc_chat_config)
 
     # Step 3. Copy tokenizer configuration
     # 3.1. Copy over the files and populate mlc_chat_config

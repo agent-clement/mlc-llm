@@ -1,5 +1,7 @@
 """A compiler pass that dispatches patterns to CUBLAS."""
 
+import os
+
 import tvm
 from tvm import IRModule, relax
 from tvm.relax.backend import get_patterns_with_prefix
@@ -36,15 +38,27 @@ class BLASDispatch:
             gv.name_hint for gv, func in mod.functions.items() if isinstance(func, relax.Function)
         ]
         # exclude single batch decode
-        model_names = [name for name in model_names if "batch" in name or "decode" not in name]
+        if os.environ.get("MLC_CUBLAS_SINGLE_DECODE", "0") != "1":
+            model_names = [name for name in model_names if "batch" in name or "decode" not in name]
+        # cuBLAS JSON codegen expects graph inputs to be tensors. Functions with shape
+        # parameters, for example dynamic-shape vision embedding, can produce fused
+        # external functions with R.Shape arguments and fail serialization.
+        model_names = [
+            name
+            for name in model_names
+            if not any(
+                isinstance(param.struct_info, relax.ShapeStructInfo)
+                for param in mod[name].params
+            )
+        ]
+        mod = relax.transform.FuseOpsByPattern(
+            self.patterns,
+            bind_constants=False,
+            annotate_codegen=True,
+            entry_functions=model_names,
+        )(mod)
         mod = tvm.transform.Sequential(
             [
-                relax.transform.FuseOpsByPattern(
-                    self.patterns,
-                    bind_constants=False,
-                    annotate_codegen=True,
-                    entry_functions=model_names,
-                ),
                 relax.transform.RunCodegen({}, entry_functions=model_names),
             ]
         )(mod)

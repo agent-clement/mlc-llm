@@ -10,6 +10,8 @@
 #include <tvm/runtime/nvtx.h>
 #include <tvm/runtime/threading_backend.h>
 
+#include <cstdlib>
+
 namespace mlc {
 namespace llm {
 namespace serve {
@@ -43,6 +45,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
         bitmask_size_((vocab_size + 31) / 32),
         softmax_func_(ft->softmax_func_),
         device_(device),
+        argmax_logits_func_(ft->gpu_argmax_logits_func_),
         apply_logit_bias_func_(ft->apply_logit_bias_func_),
         apply_penalty_func_(ft->apply_penalty_func_),
         apply_bitmask_func_(ft->apply_bitmask_func_),
@@ -62,6 +65,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
     bitmask_host_ =
         Tensor::Empty({max_num_token, bitmask_size_}, dtype_i32_, preferred_host_device);
     temperature_host_ = Tensor::Empty({max_num_token}, dtype_f32_, preferred_host_device);
+    greedy_token_ids_host_ = Tensor::Empty({max_num_token}, dtype_i32_, preferred_host_device);
     // Initialize auxiliary arrays on GPU.
     seq_ids_device_ = Tensor::Empty({max_num_token}, dtype_i32_, device);
     pos2seq_id_device_ = Tensor::Empty({max_num_token * vocab_size}, dtype_i32_, device);
@@ -71,6 +75,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
     penalties_device_ = Tensor::Empty({max_num_token, 3}, dtype_f32_, device);
     bitmask_device_ = Tensor::Empty({max_num_token, bitmask_size_}, dtype_i32_, device);
     temperature_device_ = Tensor::Empty({max_num_token}, dtype_f32_, device);
+    enable_greedy_argmax_ = std::getenv("MLC_ENABLE_GREEDY_ARGMAX") != nullptr;
 
     TVM_FFI_ICHECK(apply_logit_bias_func_.defined())
         << "Function \"apply_logit_bias_inplace\" not found in model";
@@ -127,6 +132,10 @@ class LogitProcessorImpl : public LogitProcessorObj {
     }
 
     RECORD_EVENT(trace_recorder_, request_ids, "start update logits");
+    if (!NeedLogitUpdate(generation_cfg, mstates)) {
+      RECORD_EVENT(trace_recorder_, request_ids, "finish update logits");
+      return;
+    }
 
     // Update 1. logit bias
     RECORD_EVENT(trace_recorder_, request_ids, "start apply logit bias");
@@ -208,7 +217,106 @@ class LogitProcessorImpl : public LogitProcessorObj {
     return probs.CreateView({num_total_token, vocab_size_}, probs->dtype);
   }
 
+  bool CanSampleGreedy(const Array<GenerationConfig>& generation_cfg) final {
+    if (!enable_greedy_argmax_ || !argmax_logits_func_.defined()) {
+      return false;
+    }
+    for (const GenerationConfig& cfg : generation_cfg) {
+      if (cfg->temperature >= eps_ || cfg->top_logprobs != 0 || cfg->logprobs) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  bool CanBypassLogitsForGreedy(const Array<GenerationConfig>& generation_cfg,
+                                const Array<RequestModelState>& mstates) final {
+    TVM_FFI_ICHECK_EQ(generation_cfg.size(), mstates.size());
+    for (int i = 0; i < static_cast<int>(generation_cfg.size()); ++i) {
+      const GenerationConfig& cfg = generation_cfg[i];
+      const RequestModelState& mstate = mstates[i];
+      if (cfg->temperature >= eps_ || cfg->top_logprobs != 0 || cfg->logprobs ||
+          !cfg->logit_bias.empty() || cfg->frequency_penalty != 0.0 ||
+          cfg->presence_penalty != 0.0 || cfg->repetition_penalty != 1.0 || cfg->n != 1 ||
+          mstate->require_retokenization_in_next_decode || mstate->RequireNextTokenBitmask()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::vector<SampleResult> SampleGreedyFromLogits(Tensor logits,
+                                                   const Array<GenerationConfig>& generation_cfg,
+                                                   const Array<String>& request_ids) final {
+    NVTXScopedRange nvtx_scope("Sample greedy from logits");
+    TVM_FFI_ICHECK(CanSampleGreedy(generation_cfg));
+    TVM_FFI_ICHECK_EQ(logits->ndim, 2);
+    TVM_FFI_ICHECK_LE(logits->shape[0], max_num_token_);
+    TVM_FFI_ICHECK_EQ(logits->shape[1], vocab_size_);
+    TVM_FFI_ICHECK(logits.DataType() == DataType::Float(32));
+    int num_total_token = logits->shape[0];
+    TVM_FFI_ICHECK_EQ(static_cast<int>(generation_cfg.size()), num_total_token);
+
+    RECORD_EVENT(trace_recorder_, request_ids, "start greedy argmax");
+    Tensor token_ids_device = argmax_logits_func_(logits).cast<Tensor>();
+    TVM_FFI_ICHECK_EQ(token_ids_device->ndim, 1);
+    TVM_FFI_ICHECK_EQ(token_ids_device->shape[0], num_total_token);
+    TVM_FFI_ICHECK(token_ids_device.DataType() == DataType::Int(32));
+
+    Tensor token_ids_host = greedy_token_ids_host_.CreateView({num_total_token}, dtype_i32_);
+    CopyArray(/*src=*/token_ids_device, /*dst=*/token_ids_host, compute_stream_);
+    DeviceAPI::Get(device_)->StreamSync(device_, compute_stream_);
+
+    const int32_t* p_token_ids = static_cast<const int32_t*>(token_ids_host->data);
+    std::vector<SampleResult> results;
+    results.reserve(num_total_token);
+    for (int i = 0; i < num_total_token; ++i) {
+      SampleResult result{{p_token_ids[i], 1.0f}, {}};
+      result.sampled_token_ids_device = token_ids_device;
+      result.sampled_token_ids_device_offset = i;
+      results.push_back(std::move(result));
+    }
+    RECORD_EVENT(trace_recorder_, request_ids, "finish greedy argmax");
+    return results;
+  }
+
+  Tensor SampleGreedyTokenIdsDeviceFromLogits(Tensor logits,
+                                              const Array<GenerationConfig>& generation_cfg,
+                                              const Array<String>& request_ids) final {
+    NVTXScopedRange nvtx_scope("Sample greedy token ids on device from logits");
+    TVM_FFI_ICHECK(CanSampleGreedy(generation_cfg));
+    TVM_FFI_ICHECK_EQ(logits->ndim, 2);
+    TVM_FFI_ICHECK_LE(logits->shape[0], max_num_token_);
+    TVM_FFI_ICHECK_EQ(logits->shape[1], vocab_size_);
+    TVM_FFI_ICHECK(logits.DataType() == DataType::Float(32));
+    TVM_FFI_ICHECK_EQ(static_cast<int>(generation_cfg.size()), logits->shape[0]);
+
+    RECORD_EVENT(trace_recorder_, request_ids, "start greedy argmax device");
+    Tensor token_ids_device = argmax_logits_func_(logits).cast<Tensor>();
+    TVM_FFI_ICHECK_EQ(token_ids_device->ndim, 1);
+    TVM_FFI_ICHECK_EQ(token_ids_device->shape[0], logits->shape[0]);
+    TVM_FFI_ICHECK(token_ids_device.DataType() == DataType::Int(32));
+    RECORD_EVENT(trace_recorder_, request_ids, "finish greedy argmax device");
+    return token_ids_device;
+  }
+
  private:
+  bool NeedLogitUpdate(const Array<GenerationConfig>& generation_cfg,
+                       const Array<RequestModelState>& mstates) {
+    for (const GenerationConfig& cfg : generation_cfg) {
+      if (!cfg->logit_bias.empty() || cfg->frequency_penalty != 0.0 ||
+          cfg->presence_penalty != 0.0 || cfg->repetition_penalty != 1.0) {
+        return true;
+      }
+    }
+    for (const RequestModelState& mstate : mstates) {
+      if (mstate->RequireNextTokenBitmask()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void UpdateWithLogitBias(Tensor logits, const Array<GenerationConfig>& generation_cfg,
                            const std::vector<int>* cum_num_token) {
     NVTXScopedRange nvtx_scope("UpdateWithLogitBias");
@@ -466,6 +574,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
   // Packed functions.
   Device device_;
   Function softmax_func_;
+  Function argmax_logits_func_;
   Function apply_logit_bias_func_;
   Function apply_penalty_func_;
   Function apply_bitmask_func_;
@@ -478,6 +587,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
   Tensor penalties_host_;
   Tensor bitmask_host_;
   Tensor temperature_host_;
+  Tensor greedy_token_ids_host_;
   // Auxiliary Tensors on GPU
   Tensor seq_ids_device_;
   Tensor pos2seq_id_device_;
@@ -495,6 +605,8 @@ class LogitProcessorImpl : public LogitProcessorObj {
   TVMStreamHandle copy_stream_ = nullptr;
   // A small epsilon.
   const double eps_ = 1e-5;
+  // Experimental path: currently slower than the existing GPU sampler in decode benchmarks.
+  bool enable_greedy_argmax_ = false;
 };
 
 LogitProcessor::LogitProcessor(int max_num_token, int vocab_size, FunctionTable* ft,

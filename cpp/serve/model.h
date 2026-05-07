@@ -14,6 +14,7 @@
 #include "../base.h"
 #include "../support/result.h"
 #include "config.h"
+#include "data.h"
 #include "draft_token_workspace_manager.h"
 #include "event_trace_recorder.h"
 #include "function_table.h"
@@ -109,6 +110,16 @@ class ModelObj : public Object {
                                int offset = 0) = 0;
 
   /*!
+   * \brief Compute embeddings from token ids that are already on the model device.
+   * \param token_ids The device token ids to compute embedding for.
+   * \return The computed embeddings.
+   */
+  virtual ObjectRef TokenEmbed(Tensor token_ids, ObjectRef* dst = nullptr, int offset = 0) = 0;
+
+  /*! \brief Whether device token ids can be embedded without host staging. */
+  virtual bool SupportsDeviceTokenEmbed() = 0;
+
+  /*!
    * \brief Compute embeddings for the input image.
    * \param image The image to compute embedding for.
    * \return The computed embeddings.
@@ -132,12 +143,22 @@ class ModelObj : public Object {
    */
   virtual bool CanGetLogits() = 0;
 
+  /*! \brief Return if the model can compute greedy token ids directly from hidden states. */
+  virtual bool CanGetTokenIds() = 0;
+
   /*!
    * \brief Compute logits for last hidden_states.
    * \param last_hidden_states The last hidden_states to compute logits for.
    * \return The computed logits.
    */
   virtual Tensor GetLogits(const ObjectRef& last_hidden_states) = 0;
+
+  /*!
+   * \brief Compute greedy token ids for last hidden_states without materializing logits.
+   * \param last_hidden_states The last hidden_states to compute token ids for.
+   * \return The computed token ids.
+   */
+  virtual Tensor GetTokenIds(const ObjectRef& last_hidden_states) = 0;
 
   virtual Array<Tensor> GetMultiStepLogits(const ObjectRef& last_hidden_states) = 0;
 
@@ -152,6 +173,11 @@ class ModelObj : public Object {
    */
   virtual Tensor BatchPrefill(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
                               const std::vector<int>& lengths) = 0;
+
+  virtual Tensor BatchPrefillWithMrope(const ObjectRef& embeddings,
+                                       const std::vector<int64_t>& seq_ids,
+                                       const std::vector<int>& lengths,
+                                       const std::vector<Array<Data>>& input_data) = 0;
 
   /*!
    * \brief Batch prefill function. Input hidden_states are computed from

@@ -1,7 +1,8 @@
 """Classes denoting multi-modality data used in MLC LLM serving"""
 
+import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple  # noqa: UP035
+from typing import Dict, List, Optional, Tuple, Union  # noqa: UP035
 
 import tvm
 import tvm_ffi
@@ -70,17 +71,34 @@ class ImageData(Data):
         The image data.
     """
 
-    def __init__(self, image: Tensor, embed_size: int):
-        self.embed_size = embed_size
-        self.__init_handle_by_constructor__(_ffi_api.ImageData, image, embed_size)
+    def __init__(
+        self,
+        image: Tensor,
+        embed_size: int,
+        grid_thw: Optional[Tuple[int, int, int]] = None,  # noqa: UP006
+    ):
+        if grid_thw is None:
+            self.__init_handle_by_constructor__(_ffi_api.ImageData, image, embed_size)
+        else:
+            grid_t, grid_h, grid_w = grid_thw
+            self.__init_handle_by_constructor__(
+                _ffi_api.ImageDataWithGrid, image, embed_size, grid_t, grid_h, grid_w
+            )
 
     @property
     def image(self) -> Tensor:
         """Return the image data."""
         return _ffi_api.ImageDataGetImage(self)
 
+    def get_grid_thw(self) -> Optional[Tuple[int, int, int]]:  # noqa: UP006
+        """Return Qwen-style patch grid metadata, when available."""
+        grid_t, grid_h, grid_w = _ffi_api.ImageDataGetGridTHW(self)
+        if grid_t == 0 or grid_h == 0 or grid_w == 0:
+            return None
+        return int(grid_t), int(grid_h), int(grid_w)
+
     def __len__(self):
-        return self.embed_size
+        return int(_ffi_api.ImageDataGetEmbedSize(self))
 
     @staticmethod
     def from_url(url: str, config: Dict) -> "ImageData":  # noqa: UP006
@@ -104,28 +122,85 @@ class ImageData(Data):
         else:
             raise ValueError(f"Unsupported image URL format: {url}")
 
-        # image_embed_size = ImageData.get_embed_size(config)
-        # TODO: fix these hard-coded values for phi3.5-vision and llava
-        image_embed_size = 576
-        if config["model_type"] == "phi3_v":
-            image_embed_size = 1921
-        image_tensor = np.expand_dims(image_tensor, axis=0)  # HWC -> NHWC
+        image_embed_size, grid_thw = ImageData.get_embed_size(
+            config, image_tensor.size[::-1], return_grid=True
+        )
+        image_tensor = np.expand_dims(np.asarray(image_tensor, dtype="uint8"), axis=0)
         image_features = tvm.runtime.tensor(image_tensor)
-        image_data = ImageData(image_features, image_embed_size)
+        image_data = ImageData(image_features, image_embed_size, grid_thw)
         return image_data
 
     @staticmethod
-    def get_embed_size(config: Dict) -> int:  # noqa: UP006
+    def _smart_resize(
+        height: int,
+        width: int,
+        factor: int,
+        min_pixels: int = 65536,
+        max_pixels: int = 16777216,
+    ) -> Tuple[int, int]:
+        """Resize like Qwen VL processors: keep aspect ratio and align to patch factor."""
+
+        if height <= 0 or width <= 0:
+            raise ValueError(f"Invalid image shape: height={height}, width={width}.")
+        if max(height, width) / min(height, width) > 200:
+            raise ValueError(f"Image aspect ratio is too large: height={height}, width={width}.")
+
+        resized_height = max(factor, round(height / factor) * factor)
+        resized_width = max(factor, round(width / factor) * factor)
+        if resized_height * resized_width > max_pixels:
+            beta = math.sqrt((height * width) / max_pixels)
+            resized_height = math.floor(height / beta / factor) * factor
+            resized_width = math.floor(width / beta / factor) * factor
+        elif resized_height * resized_width < min_pixels:
+            beta = math.sqrt(min_pixels / (height * width))
+            resized_height = math.ceil(height * beta / factor) * factor
+            resized_width = math.ceil(width * beta / factor) * factor
+        return int(resized_height), int(resized_width)
+
+    @staticmethod
+    def get_embed_size(
+        config: Dict,
+        image_shape: Optional[Tuple[int, int]] = None,  # noqa: UP006
+        return_grid: bool = False,
+    ) -> Union[int, Tuple[int, Optional[Tuple[int, int, int]]]]:  # noqa: UP006
         """Get the image embedding size from the model config file."""
-        image_size = config["model_config"]["vision_config"]["image_size"]
-        patch_size = config["model_config"]["vision_config"]["patch_size"]
-        embed_size = (image_size // patch_size) ** 2
-        return embed_size
+        model_config = config["model_config"]
+        vision_config = model_config["vision_config"]
+        if config["model_type"] == "qwen3_5":
+            if image_shape is None:
+                raise ValueError("image_shape is required to compute Qwen3.5 image embed size.")
+            height, width = image_shape
+            patch_size = int(vision_config.get("patch_size", 16))
+            merge_size = int(vision_config.get("spatial_merge_size", 2))
+            factor = patch_size * merge_size
+            min_pixels = int(vision_config.get("min_pixels", 65536))
+            max_pixels = int(vision_config.get("max_pixels", 16777216))
+            resized_height, resized_width = ImageData._smart_resize(
+                height, width, factor, min_pixels, max_pixels
+            )
+            grid_h = resized_height // patch_size
+            grid_w = resized_width // patch_size
+            embed_size = (grid_h // merge_size) * (grid_w // merge_size)
+            if return_grid:
+                return embed_size, (1, grid_h, grid_w)
+            return embed_size
+
+        if config["model_type"] == "phi3_v":
+            return (1921, None) if return_grid else 1921
+        if "image_size" in vision_config:
+            image_size = vision_config["image_size"]
+            patch_size = vision_config["patch_size"]
+            embed_size = (image_size // patch_size) ** 2
+            return (embed_size, None) if return_grid else embed_size
+        return (576, None) if return_grid else 576
 
     @staticmethod
     def get_input_size(config: Dict) -> int:  # noqa: UP006
         """Get the image input size from the model config file."""
-        image_size = config["model_config"]["vision_config"]["image_size"]
+        vision_config = config["model_config"]["vision_config"]
+        if config["model_type"] == "qwen3_5":
+            return int(math.sqrt(int(vision_config.get("min_pixels", 65536))))
+        image_size = vision_config["image_size"]
         return image_size
 
 
